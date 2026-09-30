@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantum-circuit-simulator"
+version = "0.1.0"
+description = "Quantum circuit construction, simulation and verification"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+quantum-circuit-simulator = "quantum_circuit.cli:main"
+
+[tool.setuptools]
+packages = ["quantum_circuit"]
