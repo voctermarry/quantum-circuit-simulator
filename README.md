@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前处于基线状态：只有项目骨架，尚未实现任何业务算法。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`。
 
 ## 环境与安装
 
@@ -18,23 +18,69 @@ python -m pip install -e .
 python -m pytest
 ```
 
-基线尚无测试用例，收集到 0 个用例属预期结果。
-
 ## 命令行入口
 
 安装后提供 `quantum-circuit-simulator` 命令：
 
 ```bash
-quantum-circuit-simulator version    # 打印版本号
-quantum-circuit-simulator --help     # 打印用法
+quantum-circuit-simulator version                # 打印版本号
+quantum-circuit-simulator --help                 # 打印用法
+quantum-circuit-simulator simulate circuit.qasm  # 仿真并采样
 ```
+
+### simulate 子命令
+
+```bash
+quantum-circuit-simulator simulate SOURCE [--shots N] [--seed S]
+```
+
+- `SOURCE`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取。
+- `--shots`：采样次数，默认 `1024`，必须为正整数。
+- `--seed`：采样随机数种子，默认 `0`，接受有符号整数。相同源文件、shots、seed 的重复运行产生字节一致的输出。
+
+成功时 stdout 输出单行 JSON，字段顺序固定：
+
+```json
+{"schema_version": 1, "shots": 1024, "seed": 0, "num_qubits": 2, "num_clbits": 2, "counts": {"00": 512, "11": 512}}
+```
+
+`counts` 的键是按经典寄存器最高下标到最低下标排列的定宽二进制串，仅包含出现过的结果，按键的字典序输出；计数总和等于 shots，未写入的经典位保持 0。
+
+### 支持的 OpenQASM 2.0 子集
+
+```
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg name[size];
+creg name[size];
+x q[i];
+h q[i];
+cx q[i], q[j];
+measure q[i] -> c[k];
+```
+
+- 必须以 `OPENQASM 2.0;` 和 `include "qelib1.inc";` 开头。
+- 恰好声明一个非空 `qreg` 和一个非空 `creg`；支持 `//` 行注释。
+- 门与测量只接受带常量下标的单个位；语句按源码顺序生效。
+- 测量只能出现在所有量子门之后，每个量子位、经典位最多参与一次测量。
+
+### 退出码与错误输出
+
+失败时 stdout 为空，stderr 输出单行 JSON：
+
+| 情况 | 退出码 | error |
+| --- | --- | --- |
+| 文件不存在、不可读或不是合法 UTF-8 | 1 | `io_error` |
+| 词法/语法错误（带从 1 开始的 line、column） | 2 | `parse_error` |
+| 重复声明、寄存器越界或大小非法、名称未声明、重复测量、测量后仍有量子门等（带源码位置） | 2 | `validation_error` |
+| `--shots`/`--seed` 等命令行参数错误（不读取输入） | 2 | 参数用法错误 |
 
 ## 现有公开接口
 
-- 命令行程序 `quantum-circuit-simulator`
+- 命令行程序 `quantum-circuit-simulator`（`version` 与 `simulate` 子命令）
 - Python 包 `quantum_circuit`，其 `__version__` 为当前版本号
 
 ## 限制
 
-- 除版本查询外没有其他功能。
-- 输入输出格式、数据来源与算法均尚未定义。
+- 仅支持 OpenQASM 2.0 的上述子集：`x`、`h`、`cx` 三个门与按位测量，不支持参数化门、条件执行或多寄存器。
+- 状态向量随量子位数指数增长，寄存器大小上限为 20。
