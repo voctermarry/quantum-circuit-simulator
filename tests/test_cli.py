@@ -264,3 +264,61 @@ def test_process_stdin_success_is_single_json_line():
     data = json.loads(result.stdout)
     assert data["shots"] == 8
     assert sum(data["counts"].values()) == 8
+
+
+# ------------------------------------------------------- parameterized gates
+
+
+def test_parameterized_gates_end_to_end(write_qasm, capsys):
+    path = write_qasm(
+        "qreg q[2];\ncreg c[2];\nrx(pi) q[0];\nry(pi/2) q[1];\nrz(-pi/4) q[0];\n"
+        "measure q[0] -> c[0];\nmeasure q[1] -> c[1];\n"
+    )
+    rc = cli.main(["simulate", path, "--shots", "64", "--seed", "5"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert sum(data["counts"].values()) == 64
+    # rx(pi) flips q[0] deterministically, so c[0] is always 1.
+    assert all(key.endswith("1") for key in data["counts"])
+
+
+def test_parameterized_gates_output_is_byte_identical(write_qasm, capsys):
+    path = write_qasm(
+        "qreg q[2];\ncreg c[2];\nrx(0.3+pi/4) q[0];\nry(1e-1*2) q[1];\n"
+        "measure q[0] -> c[0];\nmeasure q[1] -> c[1];\n"
+    )
+    outputs = set()
+    for _ in range(3):
+        assert cli.main(["simulate", path, "--shots", "256", "--seed", "77"]) == 0
+        outputs.add(capsys.readouterr().out)
+    assert len(outputs) == 1
+
+
+def test_parameterized_gate_parse_error(write_qasm, capsys):
+    path = write_qasm("qreg q[1];\ncreg c[1];\nrx() q[0];\n")
+    rc = cli.main(["simulate", path])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["error"] == "parse_error"
+    assert payload["line"] >= 1 and payload["column"] >= 1
+
+
+def test_parameterized_gate_validation_error(write_qasm, capsys):
+    path = write_qasm("qreg q[1];\ncreg c[1];\nrx(1/0) q[0];\n")
+    rc = cli.main(["simulate", path])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["error"] == "validation_error"
+    assert payload["line"] >= 1 and payload["column"] >= 1
+
+
+def test_process_parameterized_gate_from_stdin():
+    source = HEADER + "qreg q[1];\ncreg c[1];\nrx(pi) q[0];\nmeasure q[0] -> c[0];\n"
+    result = _run_process("simulate", "-", "--shots", "16", "--seed", "3", stdin=source)
+    assert result.returncode == 0
+    assert result.stdout.count("\n") == 1
+    assert json.loads(result.stdout)["counts"] == {"1": 16}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import cmath
 import math
 
 from quantum_circuit.openqasm import parse
@@ -116,3 +117,76 @@ def test_counts_keys_are_sorted_lexicographically():
     program = _program(body)
     counts = sample_counts(program, simulate_state_vector(program), 200, 9)
     assert list(counts) == sorted(counts)
+
+
+# ------------------------------------------------------- parameterized gates
+
+
+def test_rx_pi_acts_like_x_up_to_phase():
+    _, state = _amplitudes("qreg q[1];\ncreg c[1];\nrx(pi) q[0];\n")
+    assert abs(state[0]) < 1e-12
+    assert abs(abs(state[1]) - 1.0) < 1e-12
+
+
+def test_ry_pi_acts_like_x():
+    _, state = _amplitudes("qreg q[1];\ncreg c[1];\nry(pi) q[0];\n")
+    assert abs(state[0]) < 1e-12
+    assert abs(state[1] - 1.0) < 1e-12
+
+
+def test_rx_half_pi_amplitudes():
+    _, state = _amplitudes("qreg q[1];\ncreg c[1];\nrx(pi/2) q[0];\n")
+    c = math.cos(math.pi / 4)
+    s = math.sin(math.pi / 4)
+    assert abs(state[0] - c) < 1e-12
+    assert abs(state[1] - (-1j * s)) < 1e-12
+
+
+def test_ry_half_pi_amplitudes():
+    _, state = _amplitudes("qreg q[1];\ncreg c[1];\nry(pi/2) q[0];\n")
+    c = math.cos(math.pi / 4)
+    s = math.sin(math.pi / 4)
+    assert abs(state[0] - c) < 1e-12
+    assert abs(state[1] - s) < 1e-12
+
+
+def test_rz_applies_relative_phase():
+    _, state = _amplitudes("qreg q[1];\ncreg c[1];\nh q[0];\nrz(pi/2) q[0];\n")
+    theta = math.pi / 2
+    assert abs(state[0] - cmath.exp(-0.5j * theta) / math.sqrt(2)) < 1e-12
+    assert abs(state[1] - cmath.exp(0.5j * theta) / math.sqrt(2)) < 1e-12
+
+
+def test_h_rz_pi_h_is_deterministic_not_gate():
+    # Rz(pi) is Z up to a global phase, so H . Rz(pi) . H flips |0> to |1>.
+    program = _program("qreg q[1];\ncreg c[1];\nh q[0];\nrz(pi) q[0];\nh q[0];\nmeasure q[0] -> c[0];\n")
+    counts = sample_counts(program, simulate_state_vector(program), 32, 0)
+    assert counts == {"1": 32}
+
+
+def test_rx_applies_to_each_amplitude_pair_of_entangled_state():
+    # Bell state (|00>+|11>)/sqrt(2); rx(pi) on q[1] maps it to -i(|01>+|10>)/sqrt(2).
+    _, state = _amplitudes("qreg q[2];\ncreg c[2];\nh q[0];\ncx q[0],q[1];\nrx(pi) q[1];\n")
+    assert abs(state[0]) < 1e-12 and abs(state[3]) < 1e-12
+    assert abs(abs(state[1]) - 1 / math.sqrt(2)) < 1e-12
+    assert abs(abs(state[2]) - 1 / math.sqrt(2)) < 1e-12
+
+
+def test_parameterized_gates_preserve_norm():
+    _, state = _amplitudes(
+        "qreg q[3];\ncreg c[3];\n"
+        "h q[0];\ncx q[0],q[2];\nrx(pi/3) q[1];\nry(-pi/7) q[2];\nrz(2*pi) q[0];\n"
+    )
+    norm = sum(abs(a) ** 2 for a in state)
+    assert abs(norm - 1.0) < 1e-12
+
+
+def test_parameterized_gate_counts_are_reproducible():
+    body = "qreg q[1];\ncreg c[1];\nrx(pi/3) q[0];\nmeasure q[0] -> c[0];\n"
+    program = _program(body)
+    state = simulate_state_vector(program)
+    first = sample_counts(program, state, 500, 11)
+    second = sample_counts(program, state, 500, 11)
+    assert first == second
+    assert sum(first.values()) == 500
+    assert set(first) <= {"0", "1"}

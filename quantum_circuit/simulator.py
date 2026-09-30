@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import cmath
+import math
 import random
 
 from .openqasm import Program
@@ -40,6 +42,45 @@ def _controlled_x(state: list[complex], control: int, target: int, num_qubits: i
                 state[index], state[other] = state[other], state[index]
 
 
+def _rx(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None:
+    c = math.cos(theta / 2)
+    s = math.sin(theta / 2)
+    bit = 1 << qubit
+    step = bit << 1
+    for base in range(0, 1 << num_qubits, step):
+        for low in range(base, base + bit):
+            high = low | bit
+            a = state[low]
+            b = state[high]
+            state[low] = c * a - 1j * s * b
+            state[high] = -1j * s * a + c * b
+
+
+def _ry(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None:
+    c = math.cos(theta / 2)
+    s = math.sin(theta / 2)
+    bit = 1 << qubit
+    step = bit << 1
+    for base in range(0, 1 << num_qubits, step):
+        for low in range(base, base + bit):
+            high = low | bit
+            a = state[low]
+            b = state[high]
+            state[low] = c * a - s * b
+            state[high] = s * a + c * b
+
+
+def _rz(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None:
+    lo_factor = cmath.exp(-0.5j * theta)
+    hi_factor = cmath.exp(0.5j * theta)
+    bit = 1 << qubit
+    for index in range(1 << num_qubits):
+        if index & bit:
+            state[index] = hi_factor * state[index]
+        else:
+            state[index] = lo_factor * state[index]
+
+
 def simulate_state_vector(program: Program) -> list[complex]:
     """Return the final state vector after applying all quantum gates.
 
@@ -60,6 +101,12 @@ def simulate_state_vector(program: Program) -> list[complex]:
             _hadamard(state, op.targets[0], n)
         elif op.kind == "cx":
             _controlled_x(state, op.targets[0], op.targets[1], n)
+        elif op.kind == "rx":
+            _rx(state, op.targets[0], n, op.params[0])
+        elif op.kind == "ry":
+            _ry(state, op.targets[0], n, op.params[0])
+        elif op.kind == "rz":
+            _rz(state, op.targets[0], n, op.params[0])
         # "measure" operations affect only the sampled classical outcomes.
     return state
 

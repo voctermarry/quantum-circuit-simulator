@@ -9,15 +9,25 @@ Supported subset::
     x qubit;
     h qubit;
     cx qubit, qubit;
+    rx(angle) qubit;
+    ry(angle) qubit;
+    rz(angle) qubit;
     measure qubit -> cbit;
 
 Only one ``qreg`` and one ``creg`` may be declared, and gates/measures only
 accept single bits with constant integer indices. Line comments (``//``) are
 supported.
+
+Angle expressions are written in radians and may use decimal integer and
+real literals (including scientific notation), the constant ``pi``,
+parentheses, unary ``+``/``-`` and the binary operators ``+``, ``-``, ``*``
+and ``/`` with the usual precedence (``*``/``/`` before ``+``/``-``, same
+precedence evaluated left to right, parentheses first).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -50,7 +60,8 @@ class Token:
 
 
 _KEYWORDS = {"OPENQASM", "include", "qreg", "creg", "measure"}
-_BUILTIN_GATES = {"x", "h", "cx"}
+_BUILTIN_GATES = {"x", "h", "cx", "rx", "ry", "rz"}
+_PARAMETERIZED_GATES = {"rx", "ry", "rz"}
 
 # A state vector has 2**n amplitudes; larger registers cannot be simulated
 # and are rejected as illegal sizes rather than crashing.
@@ -147,7 +158,7 @@ def tokenize(source: str) -> list[Token]:
             col += 2
             continue
 
-        if ch in "[];,":
+        if ch in "[];,()+*/-":
             tokens.append(Token(ch, ch, start_line, start_col))
             i += 1
             col += 1
@@ -163,8 +174,9 @@ def tokenize(source: str) -> list[Token]:
 class Operation:
     """A validated gate application or measurement."""
 
-    kind: str  # 'x', 'h', 'cx' or 'measure'
+    kind: str  # 'x', 'h', 'cx', 'rx', 'ry', 'rz' or 'measure'
     targets: tuple[int, ...]  # qubit indices; measure appends the cbit index
+    params: tuple[float, ...] = ()  # gate angles in radians (rx/ry/rz only)
 
 
 @dataclass(frozen=True)
@@ -271,6 +283,106 @@ def parse(source: str) -> Program:
             )
         return idx, name_tok, idx_tok
 
+    def parse_angle() -> float:
+        """Parse and evaluate an angle expression (result in radians).
+
+        Grammar (usual precedence, left associativity, parentheses first)::
+
+            expr    := term (('+' | '-') term)*
+            term    := factor (('*' | '/') factor)*
+            factor  := ('+' | '-') factor | atom
+            atom    := int | real | 'pi' | '(' expr ')'
+        """
+
+        def check_finite(value: float, op_tok: Token) -> float:
+            if not math.isfinite(value):
+                raise ValidationError(
+                    "angle expression result is not a finite number",
+                    op_tok.line,
+                    op_tok.column,
+                )
+            return value
+
+        def parse_atom() -> float:
+            tok = peek()
+            if tok.kind == "int":
+                advance()
+                return float(_parse_decimal(tok))
+            if tok.kind == "real":
+                advance()
+                try:
+                    value = float(tok.value)
+                except ValueError:
+                    raise ParseError(
+                        f"malformed numeric literal {tok.value!r}",
+                        tok.line,
+                        tok.column,
+                    ) from None
+                if not math.isfinite(value):
+                    raise ValidationError(
+                        f"numeric literal {tok.value!r} is too large",
+                        tok.line,
+                        tok.column,
+                    )
+                return value
+            if tok.kind == "ident":
+                advance()
+                if tok.value == "pi":
+                    return math.pi
+                raise ValidationError(
+                    f"unknown name {tok.value!r} in angle expression",
+                    tok.line,
+                    tok.column,
+                )
+            if tok.kind == "(":
+                advance()
+                value = parse_expr()
+                expect(")")
+                return value
+            raise ParseError(
+                f"expected a number, 'pi' or '(' but found {tok.value!r}",
+                tok.line,
+                tok.column,
+            )
+
+        def parse_factor() -> float:
+            tok = peek()
+            if tok.kind == "+" or tok.kind == "-":
+                advance()
+                operand = parse_factor()
+                return operand if tok.kind == "+" else -operand
+            return parse_atom()
+
+        def parse_term() -> float:
+            value = parse_factor()
+            while peek().kind == "*" or peek().kind == "/":
+                op_tok = advance()
+                rhs = parse_factor()
+                if op_tok.kind == "*":
+                    value = check_finite(value * rhs, op_tok)
+                else:
+                    if rhs == 0.0:
+                        raise ValidationError(
+                            "division by zero in angle expression",
+                            op_tok.line,
+                            op_tok.column,
+                        )
+                    value = check_finite(value / rhs, op_tok)
+            return value
+
+        def parse_expr() -> float:
+            value = parse_term()
+            while peek().kind == "+" or peek().kind == "-":
+                op_tok = advance()
+                rhs = parse_term()
+                if op_tok.kind == "+":
+                    value = check_finite(value + rhs, op_tok)
+                else:
+                    value = check_finite(value - rhs, op_tok)
+            return value
+
+        return parse_expr()
+
     while peek().kind != "eof":
         tok = peek()
 
@@ -372,6 +484,20 @@ def parse(source: str) -> Program:
                         tgt_name_tok.column,
                     )
                 operations.append(Operation("cx", (ctrl, tgt)))
+            elif gate_name in _PARAMETERIZED_GATES:
+                expect("(")
+                angle = parse_angle()
+                if peek().kind == ",":
+                    comma = peek()
+                    raise ParseError(
+                        f"gate {gate_name!r} takes exactly one angle parameter",
+                        comma.line,
+                        comma.column,
+                    )
+                expect(")")
+                target, _, _ = parse_index("q")
+                expect(";")
+                operations.append(Operation(gate_name, (target,), (angle,)))
             else:
                 target, _, _ = parse_index("q")
                 expect(";")
