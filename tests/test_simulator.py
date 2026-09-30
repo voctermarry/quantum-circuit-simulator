@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import cmath
 import math
 
 from quantum_circuit.openqasm import parse
@@ -116,3 +117,60 @@ def test_counts_keys_are_sorted_lexicographically():
     program = _program(body)
     counts = sample_counts(program, simulate_state_vector(program), 200, 9)
     assert list(counts) == sorted(counts)
+
+
+# ------------------------------------------------------- parameterized gates
+
+
+def test_rx_pi_acts_like_x_up_to_phase():
+    _, state = _amplitudes("qreg q[1];\ncreg c[1];\nrx(pi) q[0];\n")
+    assert abs(state[0]) < 1e-12
+    assert abs(state[1] - (-1j)) < 1e-12
+
+
+def test_ry_pi_flips_with_real_amplitude():
+    _, state = _amplitudes("qreg q[1];\ncreg c[1];\nry(pi) q[0];\n")
+    assert abs(state[0]) < 1e-12
+    assert abs(state[1] - 1.0) < 1e-12
+
+
+def test_rx_half_pi_gives_equal_superposition_magnitudes():
+    _, state = _amplitudes("qreg q[1];\ncreg c[1];\nrx(pi/2) q[0];\n")
+    assert abs(abs(state[0]) ** 2 - 0.5) < 1e-12
+    assert abs(abs(state[1]) ** 2 - 0.5) < 1e-12
+    assert abs(state[1] - (-1j / math.sqrt(2))) < 1e-12
+
+
+def test_rz_applies_relative_phase_on_superposition():
+    theta = math.pi / 3
+    _, state = _amplitudes("qreg q[1];\ncreg c[1];\nh q[0];\nrz(pi/3) q[0];\n")
+    assert abs(state[0] - cmath.exp(-0.5j * theta) / math.sqrt(2)) < 1e-12
+    assert abs(state[1] - cmath.exp(0.5j * theta) / math.sqrt(2)) < 1e-12
+
+
+def test_rz_does_not_change_measurement_statistics():
+    body = "qreg q[1];\ncreg c[1];\nh q[0];\nrz(7*pi/5) q[0];\nmeasure q[0] -> c[0];\n"
+    program = _program(body)
+    counts = sample_counts(program, simulate_state_vector(program), 200, 4)
+    assert set(counts) <= {"0", "1"}
+    assert sum(counts.values()) == 200
+
+
+def test_rotations_apply_to_each_target_pair_in_entangled_state():
+    # Bell state, then rx(pi) on q[0]: each (a, b) pair maps to (-i b, -i a).
+    _, state = _amplitudes(
+        "qreg q[2];\ncreg c[2];\nh q[1];\ncx q[1],q[0];\nrx(pi) q[0];\n"
+    )
+    assert abs(state[0]) < 1e-12 and abs(state[3]) < 1e-12
+    assert abs(state[1] - (-1j / math.sqrt(2))) < 1e-12
+    assert abs(state[2] - (-1j / math.sqrt(2))) < 1e-12
+
+
+def test_rotation_expressions_compose_with_other_gates():
+    # ry(pi/2) then rx(pi) on the same qubit, checked against the matrices.
+    theta = math.pi / 2
+    _, state = _amplitudes("qreg q[1];\ncreg c[1];\nry(pi/2) q[0];\nrx(pi) q[0];\n")
+    c, s = math.cos(theta / 2), math.sin(theta / 2)
+    a, b = c, s  # after ry
+    assert abs(state[0] - (-1j * b)) < 1e-12
+    assert abs(state[1] - (-1j * a)) < 1e-12

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import cmath
+import math
 import random
 
 from .openqasm import Program
@@ -40,6 +42,42 @@ def _controlled_x(state: list[complex], control: int, target: int, num_qubits: i
                 state[index], state[other] = state[other], state[index]
 
 
+def _rotate_x(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None:
+    c = math.cos(theta / 2.0)
+    s = math.sin(theta / 2.0)
+    bit = 1 << qubit
+    step = bit << 1
+    for base in range(0, 1 << num_qubits, step):
+        for low in range(base, base + bit):
+            high = low | bit
+            a = state[low]
+            b = state[high]
+            state[low] = c * a - 1j * s * b
+            state[high] = c * b - 1j * s * a
+
+
+def _rotate_y(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None:
+    c = math.cos(theta / 2.0)
+    s = math.sin(theta / 2.0)
+    bit = 1 << qubit
+    step = bit << 1
+    for base in range(0, 1 << num_qubits, step):
+        for low in range(base, base + bit):
+            high = low | bit
+            a = state[low]
+            b = state[high]
+            state[low] = c * a - s * b
+            state[high] = s * a + c * b
+
+
+def _rotate_z(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None:
+    low_phase = cmath.exp(-0.5j * theta)
+    high_phase = cmath.exp(0.5j * theta)
+    bit = 1 << qubit
+    for index in range(1 << num_qubits):
+        state[index] *= high_phase if index & bit else low_phase
+
+
 def simulate_state_vector(program: Program) -> list[complex]:
     """Return the final state vector after applying all quantum gates.
 
@@ -60,6 +98,12 @@ def simulate_state_vector(program: Program) -> list[complex]:
             _hadamard(state, op.targets[0], n)
         elif op.kind == "cx":
             _controlled_x(state, op.targets[0], op.targets[1], n)
+        elif op.kind == "rx":
+            _rotate_x(state, op.targets[0], n, op.angle)
+        elif op.kind == "ry":
+            _rotate_y(state, op.targets[0], n, op.angle)
+        elif op.kind == "rz":
+            _rotate_z(state, op.targets[0], n, op.angle)
         # "measure" operations affect only the sampled classical outcomes.
     return state
 

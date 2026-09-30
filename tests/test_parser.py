@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from quantum_circuit.openqasm import ParseError, ValidationError, parse, tokenize
@@ -197,3 +199,90 @@ def test_missing_creg_rejected():
 def test_cx_control_and_target_must_differ():
     exc = _validation("qreg q[2];\ncreg c[1];\ncx q[0], q[0];\nmeasure q[0]->c[0];\n")
     assert "different" in exc.message
+
+
+# ------------------------------------------------------- parameterized gates
+
+
+def test_tokenizer_accepts_expression_punctuation():
+    tokens = tokenize("rx(-(1+2)*3/4) q[0];")
+    kinds = [t.kind for t in tokens]
+    assert kinds == [
+        "ident", "(", "-", "(", "int", "+", "int", ")", "*", "int",
+        "/", "int", ")", "ident", "[", "int", "]", ";", "eof",
+    ]
+
+
+def test_parameterized_gates_parse_with_angles():
+    program = _parse(
+        "qreg q[2];\ncreg c[2];\n"
+        "rx(pi/2) q[0];\nry(-1.5e0) q[1];\nrz(2*(pi-1)) q[0];\n"
+    )
+    kinds = [op.kind for op in program.operations]
+    assert kinds == ["rx", "ry", "rz"]
+    rx, ry, rz = program.operations
+    assert rx.targets == (0,) and abs(rx.angle - math.pi / 2) < 1e-15
+    assert ry.targets == (1,) and ry.angle == -1.5
+    assert rz.targets == (0,) and abs(rz.angle - 2 * (math.pi - 1)) < 1e-15
+
+
+def test_angle_expression_precedence_and_associativity():
+    program = _parse("qreg q[1];\ncreg c[1];\nrx(1+2*3-8/4/2) q[0];\n")
+    assert program.operations[0].angle == 1 + 6 - 1.0
+    program = _parse("qreg q[1];\ncreg c[1];\nrx(- - +pi) q[0];\n")
+    assert abs(program.operations[0].angle - math.pi) < 1e-15
+
+
+@pytest.mark.parametrize(
+    "gate_source",
+    [
+        "rx q[0];",          # missing parentheses and parameter
+        "rx() q[0];",        # missing parameter
+        "rx(1, 2) q[0];",    # more than one parameter
+        "rx(1+) q[0];",      # dangling operator
+        "rx(*2) q[0];",      # missing left operand
+        "rx(1 2) q[0];",     # missing operator
+        "rx((1) q[0];",      # unbalanced parenthesis
+        "rx(1) q[0]",        # missing semicolon
+    ],
+)
+def test_parameterized_gate_syntax_errors_are_parse_errors(gate_source):
+    with pytest.raises(ParseError):
+        _parse("qreg q[1];\ncreg c[1];\n" + gate_source)
+
+
+def test_angle_unknown_name_is_validation_error():
+    exc = _validation("qreg q[1];\ncreg c[1];\nrx(theta) q[0];\n")
+    assert "theta" in exc.message
+
+
+def test_angle_division_by_zero_is_validation_error_with_position():
+    exc = _validation("qreg q[1];\ncreg c[1];\nrx(1/0) q[0];\n")
+    assert (exc.line, exc.column) == (5, 5)  # the '/' operator
+
+
+def test_angle_literal_overflow_is_validation_error():
+    exc = _validation("qreg q[1];\ncreg c[1];\nrx(1e400) q[0];\n")
+    assert "too large" in exc.message
+    with pytest.raises(ValidationError):
+        _parse("qreg q[1];\ncreg c[1];\nrx(1234567890123456789) q[0];\n")
+
+
+def test_angle_non_finite_result_is_validation_error():
+    with pytest.raises(ValidationError) as info:
+        _parse("qreg q[1];\ncreg c[1];\nrx(1e308*1e308) q[0];\n")
+    assert "finite" in info.value.message
+
+
+def test_parameterized_gate_after_measurement_rejected():
+    exc = _validation("qreg q[1];\ncreg c[1];\nmeasure q[0] -> c[0];\nrz(pi) q[0];\n")
+    assert "after a measurement" in exc.message
+
+
+def test_parameterized_gate_target_validation():
+    # Classical register used as the target.
+    with pytest.raises(ValidationError):
+        _parse("qreg q[1];\ncreg c[1];\nrx(pi) c[0];\n")
+    # Out-of-range qubit index.
+    with pytest.raises(ValidationError):
+        _parse("qreg q[1];\ncreg c[1];\nrx(pi) q[1];\n")

@@ -9,15 +9,25 @@ Supported subset::
     x qubit;
     h qubit;
     cx qubit, qubit;
+    rx(angle) qubit;
+    ry(angle) qubit;
+    rz(angle) qubit;
     measure qubit -> cbit;
 
 Only one ``qreg`` and one ``creg`` may be declared, and gates/measures only
 accept single bits with constant integer indices. Line comments (``//``) are
 supported.
+
+Gate angles are constant expressions in radians: decimal integers, real
+literals (fractional or scientific notation), the constant ``pi``, unary
+``+``/``-`` and the binary operators ``+``, ``-``, ``*``, ``/`` with the
+usual precedence (``*``/``/`` bind tighter than ``+``/``-``, equal
+precedence associates left-to-right) and parentheses.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -50,7 +60,8 @@ class Token:
 
 
 _KEYWORDS = {"OPENQASM", "include", "qreg", "creg", "measure"}
-_BUILTIN_GATES = {"x", "h", "cx"}
+_BUILTIN_GATES = {"x", "h", "cx", "rx", "ry", "rz"}
+_PARAM_GATES = {"rx", "ry", "rz"}
 
 # A state vector has 2**n amplitudes; larger registers cannot be simulated
 # and are rejected as illegal sizes rather than crashing.
@@ -147,7 +158,7 @@ def tokenize(source: str) -> list[Token]:
             col += 2
             continue
 
-        if ch in "[];,":
+        if ch in "[];,()+-*/":
             tokens.append(Token(ch, ch, start_line, start_col))
             i += 1
             col += 1
@@ -163,8 +174,9 @@ def tokenize(source: str) -> list[Token]:
 class Operation:
     """A validated gate application or measurement."""
 
-    kind: str  # 'x', 'h', 'cx' or 'measure'
+    kind: str  # 'x', 'h', 'cx', 'rx', 'ry', 'rz' or 'measure'
     targets: tuple[int, ...]  # qubit indices; measure appends the cbit index
+    angle: float = 0.0  # rotation angle in radians (parameterized gates only)
 
 
 @dataclass(frozen=True)
@@ -271,6 +283,99 @@ def parse(source: str) -> Program:
             )
         return idx, name_tok, idx_tok
 
+    # Constant angle expressions, evaluated as floats while parsing.
+    # Precedence: unary +/-, then * and /, then +/- (left-associative);
+    # parentheses override. Grammar errors are ParseError; unknown names,
+    # division by zero, overflowing literals and non-finite results are
+    # ValidationError.
+    def parse_angle() -> float:
+        first = peek()
+        value = parse_sum()
+        if not math.isfinite(value):
+            raise ValidationError(
+                "angle expression does not evaluate to a finite number",
+                first.line,
+                first.column,
+            )
+        return value
+
+    def parse_sum() -> float:
+        value = parse_product()
+        while peek().kind in ("+", "-"):
+            op = advance()
+            rhs = parse_product()
+            value = value + rhs if op.kind == "+" else value - rhs
+        return value
+
+    def parse_product() -> float:
+        value = parse_unary()
+        while peek().kind in ("*", "/"):
+            op = advance()
+            rhs = parse_unary()
+            if op.kind == "*":
+                value = value * rhs
+            else:
+                if rhs == 0.0:
+                    raise ValidationError(
+                        "division by zero in angle expression",
+                        op.line,
+                        op.column,
+                    )
+                value = value / rhs
+        return value
+
+    def parse_unary() -> float:
+        tok = peek()
+        if tok.kind == "+":
+            advance()
+            return parse_unary()
+        if tok.kind == "-":
+            advance()
+            return -parse_unary()
+        return parse_primary()
+
+    def parse_primary() -> float:
+        tok = peek()
+        if tok.kind == "int":
+            advance()
+            return float(_parse_decimal(tok))
+        if tok.kind == "real":
+            advance()
+            try:
+                value = float(tok.value)
+            except ValueError:
+                raise ParseError(
+                    f"malformed numeric literal {tok.value!r}",
+                    tok.line,
+                    tok.column,
+                ) from None
+            if math.isinf(value):
+                raise ValidationError(
+                    f"real literal {tok.value!r} is too large",
+                    tok.line,
+                    tok.column,
+                )
+            return value
+        if tok.kind == "ident":
+            if tok.value == "pi":
+                advance()
+                return math.pi
+            raise ValidationError(
+                f"unknown name {tok.value!r} in angle expression",
+                tok.line,
+                tok.column,
+            )
+        if tok.kind == "(":
+            advance()
+            value = parse_sum()
+            expect(")")
+            return value
+        raise ParseError(
+            f"expected a number, 'pi' or '(' but found {tok.value!r}",
+            tok.line,
+            tok.column,
+        )
+
     while peek().kind != "eof":
         tok = peek()
 
@@ -372,6 +477,13 @@ def parse(source: str) -> Program:
                         tgt_name_tok.column,
                     )
                 operations.append(Operation("cx", (ctrl, tgt)))
+            elif gate_name in _PARAM_GATES:
+                expect("(")
+                angle = parse_angle()
+                expect(")")
+                target, _, _ = parse_index("q")
+                expect(";")
+                operations.append(Operation(gate_name, (target,), angle))
             else:
                 target, _, _ = parse_index("q")
                 expect(";")

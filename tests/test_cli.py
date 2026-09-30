@@ -264,3 +264,38 @@ def test_process_stdin_success_is_single_json_line():
     data = json.loads(result.stdout)
     assert data["shots"] == 8
     assert sum(data["counts"].values()) == 8
+
+
+def test_process_parameterized_gates_reproducible():
+    source = (
+        HEADER
+        + "qreg q[2];\ncreg c[2];\nrx(pi/2) q[0];\nry(pi) q[1];\n"
+        + "rz(-pi/4) q[0];\nmeasure q[0] -> c[0];\nmeasure q[1] -> c[1];\n"
+    )
+    first = _run_process("simulate", "-", "--shots", "200", "--seed", "11", stdin=source)
+    second = _run_process("simulate", "-", "--shots", "200", "--seed", "11", stdin=source)
+    assert first.returncode == 0
+    assert first.stdout == second.stdout
+    data = json.loads(first.stdout)
+    assert sum(data["counts"].values()) == 200
+    # ry(pi) puts q[1] in |1>, so every observed key has the high bit set.
+    assert all(key.startswith("1") for key in data["counts"])
+
+
+def test_process_angle_validation_error_exit_code():
+    source = HEADER + "qreg q[1];\ncreg c[1];\nrx(1/0) q[0];\n"
+    result = _run_process("simulate", "-", stdin=source)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    payload = json.loads(result.stderr)
+    assert payload["error"] == "validation_error"
+    assert payload["line"] == 5
+    assert payload["column"] == 5
+
+
+def test_process_angle_parse_error_exit_code():
+    source = HEADER + "qreg q[1];\ncreg c[1];\nrx() q[0];\n"
+    result = _run_process("simulate", "-", stdin=source)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["error"] == "parse_error"
