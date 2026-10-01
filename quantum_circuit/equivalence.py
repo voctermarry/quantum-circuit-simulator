@@ -43,15 +43,35 @@ def unitary_distance(u: list[list[complex]], v: list[list[complex]]) -> float:
     ``min_{|lambda|=1} ||U - lambda V||_F / sqrt(2 * dim)``, a value in
     ``[0, 1]`` that is ``0`` exactly when ``U`` and ``V`` differ only by a
     global phase.
+
+    The minimizer is ``lambda = t / |t|`` with ``t = tr(U^dagger V)``. The
+    residual norm is evaluated directly (with compensated summation) rather
+    than as ``1 - |t|/dim``: that latter form cancels to a few ulps of
+    round-off for nearly identical matrices, which a square root then
+    amplifies by orders of magnitude.
     """
     dim = len(u)
-    # t = tr(U^dagger V) = sum_{i,j} conj(U[j][i]) * V[j][i].
-    trace = 0j
-    for i in range(dim):
-        for j in range(dim):
-            trace += u[j][i].conjugate() * v[j][i]
 
-    normalized = abs(trace) / dim
-    # Round-off can push |t|/dim a hair above 1; clamp to the valid interval.
-    aligned = min(1.0, max(0.0, normalized))
-    return math.sqrt(max(0.0, 1.0 - aligned))
+    # t = tr(U^dagger V) = sum_{i,j} conj(U[j][i]) * V[j][i], summed with
+    # compensated real/imaginary accumulators.
+    products = [
+        u[j][i].conjugate() * v[j][i]
+        for i in range(dim)
+        for j in range(dim)
+    ]
+    trace = complex(math.fsum(z.real for z in products), math.fsum(z.imag for z in products))
+    magnitude = math.hypot(trace.real, trace.imag)
+    if magnitude == 0.0:
+        # No phase aligns anything: U and V are fully orthogonal.
+        return 1.0
+
+    # The minimizer of ||U - lambda V|| is lambda = conj(t)/|t|.
+    lam = trace.conjugate() / magnitude
+    residual_sq = math.fsum(
+        abs(u[j][i] - lam * v[j][i]) ** 2
+        for i in range(dim)
+        for j in range(dim)
+    )
+    normalized = residual_sq / (2 * dim)
+    # Round-off can leave a hair outside [0, 1]; clamp to the valid interval.
+    return math.sqrt(min(1.0, max(0.0, normalized)))
