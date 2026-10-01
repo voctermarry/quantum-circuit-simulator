@@ -13,6 +13,7 @@ from .equivalence import (
     measurement_layout,
     unitary_distance,
 )
+from .metrics import single_qubit_entropies, state_fidelity
 from .noise import (
     MAX_NOISE_QUBITS,
     NoiseModelError,
@@ -192,12 +193,13 @@ def _optimize(source_arg: str) -> int:
     return 0
 
 
-def _load_comparison_program(side: str, source_arg: str):
-    """Read, parse and size-check one side of an equivalence comparison.
+def _load_program(side: str, source_arg: str):
+    """Read, parse and validate one side of a two-circuit comparison.
 
-    Returns the parsed :class:`Program`, or an exit code (1, 2 or 3) after
-    emitting the appropriate single-line error on stderr. *side* is ``"left"``
-    or ``"right"`` and is reported as ``input`` on every failure.
+    Returns the parsed :class:`Program`, or an exit code (1 or 2) after
+    emitting the appropriate single-line error on stderr. *side* is
+    ``"left"`` or ``"right"`` and is reported as ``input`` on every
+    failure.
     """
     try:
         if source_arg == "-":
@@ -227,6 +229,19 @@ def _load_comparison_program(side: str, source_arg: str):
     except ValidationError as exc:
         _emit_error("validation_error", exc.message, exc.line, exc.column, side=side)
         return None, 2
+
+    return program, None
+
+
+def _load_comparison_program(side: str, source_arg: str):
+    """Load one side of an equivalence comparison, enforcing the size cap.
+
+    Like :func:`_load_program`, but additionally rejects circuits larger
+    than ``MAX_EQUIVALENCE_QUBITS`` with exit code 3.
+    """
+    program, error_code = _load_program(side, source_arg)
+    if program is None:
+        return None, error_code
 
     if program.num_qubits > MAX_EQUIVALENCE_QUBITS:
         _emit_error(
@@ -305,6 +320,47 @@ def _equivalent(left_arg: str, right_arg: str) -> int:
     return 0
 
 
+def _state_metrics(left_arg: str, right_arg: str) -> int:
+    if left_arg == "-" and right_arg == "-":
+        # Standard input cannot serve both sides; do not read it.
+        _emit_error(
+            "metrics_error",
+            "left and right inputs cannot both be read from standard input",
+        )
+        return 2
+
+    # Fully validate each side (read, parse, semantics) in LEFT, RIGHT
+    # order, reporting only the first failure.
+    left, error_code = _load_program("left", left_arg)
+    if left is None:
+        return error_code
+    right, error_code = _load_program("right", right_arg)
+    if right is None:
+        return error_code
+
+    left_state = simulate_state_vector(left)
+    right_state = simulate_state_vector(right)
+
+    if left.num_qubits == right.num_qubits:
+        reason = "compared"
+        fidelity: float | None = state_fidelity(left_state, right_state)
+    else:
+        reason = "qubit_count_mismatch"
+        fidelity = None
+
+    result: dict[str, object] = {
+        "schema_version": 1,
+        "left_num_qubits": left.num_qubits,
+        "right_num_qubits": right.num_qubits,
+        "reason": reason,
+        "fidelity": fidelity,
+        "left_single_qubit_entropy": single_qubit_entropies(left_state, left.num_qubits),
+        "right_single_qubit_entropy": single_qubit_entropies(right_state, right.num_qubits),
+    }
+    sys.stdout.write(json.dumps(result) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="quantum-circuit-simulator",
@@ -337,6 +393,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     optimize_parser.add_argument("source", help="path to the OpenQASM source file, or '-' for stdin")
 
+    metrics_parser = sub.add_parser(
+        "state-metrics",
+        help="compare the noiseless final states of two circuits and measure per-qubit entanglement",
+    )
+    metrics_parser.add_argument("left", help="path to the left OpenQASM source file, or '-' for stdin")
+    metrics_parser.add_argument("right", help="path to the right OpenQASM source file, or '-' for stdin")
+
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -351,6 +414,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "optimize":
         return _optimize(args.source)
+
+    if args.command == "state-metrics":
+        return _state_metrics(args.left, args.right)
 
     parser.print_help()
     return 0
