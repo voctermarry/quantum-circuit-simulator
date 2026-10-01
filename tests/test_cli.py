@@ -732,3 +732,668 @@ def test_process_batch_input_error_exit_code(tmp_path):
     assert result.returncode == 2
     assert result.stdout == ""
     assert json.loads(result.stderr)["error"] == "batch_input_error"
+
+
+# ---------------------------------------------------------------- reconcile
+
+
+@pytest.fixture
+def reconcile_env(batch_env, capsys):
+    tmp_path, qasm, model, manifest = batch_env
+
+    def _baseline(payload: object, name: str = "baseline.json") -> str:
+        path = tmp_path / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def _baseline_text(text: str, name: str = "baseline.json") -> str:
+        path = tmp_path / name
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def _run_batch(path: str) -> dict:
+        assert cli.main(["batch-simulate", path]) in (0, 3)
+        return json.loads(capsys.readouterr().out)
+
+    return tmp_path, qasm, model, manifest, _baseline, _baseline_text, _run_batch
+
+
+def _jobs_payload(jobs):
+    return {"schema_version": 1, "jobs": jobs}
+
+
+def test_reconcile_all_identical_mixed_noise(reconcile_env, capsys):
+    tmp_path, qasm, model, manifest, baseline, _text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    qasm(BELL, "bell.qasm")
+    model({"bit_flip": 0.5}, "model.json")
+    path = manifest(
+        _jobs_payload(
+            [
+                {"id": "a", "source": "a.qasm", "shots": 16, "seed": 3},
+                {"id": "bell", "source": "bell.qasm"},
+                {"id": "noisy", "source": "a.qasm", "noise_model": "model.json", "shots": 8, "seed": 1},
+            ]
+        )
+    )
+    base_path = baseline(run_batch(path))
+
+    rc = cli.main(["reconcile", path, base_path])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    data = json.loads(captured.out)
+    assert list(data) == ["schema_version", "job_count", "matched", "mismatched", "consistent", "results"]
+    assert (data["schema_version"], data["job_count"]) == (1, 3)
+    assert (data["matched"], data["mismatched"], data["consistent"]) == (3, 0, True)
+    assert [r["id"] for r in data["results"]] == ["a", "bell", "noisy"]
+    assert all(list(r) == ["id", "consistent", "reason"] for r in data["results"])
+    assert all(r["consistent"] is True and r["reason"] == "identical" for r in data["results"])
+
+
+def test_reconcile_identical_failures_exit_zero(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    bad = tmp_path / "bad.qasm"
+    bad.write_text(HEADER + "qreg q[1];\ncreg c[1];\nx q[0]\n", encoding="utf-8")
+    qasm(X_CIRCUIT, "ok.qasm")
+    path = manifest(
+        _jobs_payload(
+            [
+                {"id": "parse", "source": "bad.qasm"},
+                {"id": "ok", "source": "ok.qasm", "shots": 4, "seed": 1},
+            ]
+        )
+    )
+    base_path = baseline(run_batch(path))
+
+    rc = cli.main(["reconcile", path, baseline(json.load(open(base_path)))])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.err == ""
+    data = json.loads(captured.out)
+    assert (data["matched"], data["mismatched"], data["consistent"]) == (2, 0, True)
+
+
+def test_reconcile_output_mismatch_report_and_exit_code(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 10, "seed": 1}]))
+    payload = run_batch(path)
+    expected_output = json.loads(json.dumps(payload["results"][0]["output"]))
+    payload["results"][0]["output"]["counts"] = {"1": 9, "0": 1}
+
+    rc = cli.main(["reconcile", path, baseline(payload)])
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert captured.err == ""
+    data = json.loads(captured.out)
+    assert (data["matched"], data["mismatched"], data["consistent"]) == (0, 1, False)
+    entry = data["results"][0]
+    assert list(entry) == ["id", "consistent", "reason", "expected", "actual"]
+    assert entry["id"] == "a"
+    assert entry["consistent"] is False
+    assert entry["reason"] == "output_mismatch"
+    # The complete baseline and current task results are preserved.
+    assert list(entry["expected"]) == ["id", "status", "output"]
+    assert entry["expected"]["id"] == "a"
+    assert entry["expected"]["output"]["counts"] == {"1": 9, "0": 1}
+    assert list(entry["actual"]) == ["id", "status", "output"]
+    assert entry["actual"]["output"] == expected_output
+
+
+def test_reconcile_error_mismatch(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    bad = tmp_path / "bad.qasm"
+    bad.write_text(HEADER + "qreg q[1];\ncreg c[1];\nx q[0]\n", encoding="utf-8")
+    qasm(X_CIRCUIT, "ok.qasm")
+    path = manifest(_jobs_payload([{"id": "bad", "source": "bad.qasm"}, {"id": "ok", "source": "ok.qasm"}]))
+    payload = run_batch(path)
+    payload["results"][0]["error"]["message"] = "something changed"
+
+    rc = cli.main(["reconcile", path, baseline(payload)])
+    captured = capsys.readouterr()
+    assert rc == 3
+    data = json.loads(captured.out)
+    assert (data["matched"], data["mismatched"]) == (1, 1)
+    bad_entry, ok_entry = data["results"]
+    assert bad_entry["reason"] == "error_mismatch"
+    assert bad_entry["expected"]["status"] == "failed"
+    assert bad_entry["expected"]["error"]["message"] == "something changed"
+    assert bad_entry["actual"]["status"] == "failed"
+    assert bad_entry["actual"]["error"]["error"] == "parse_error"
+    assert ok_entry["reason"] == "identical"
+
+
+def test_reconcile_status_mismatch_both_directions(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    bad = tmp_path / "bad.qasm"
+    bad.write_text(HEADER + "qreg q[1];\ncreg c[1];\nx q[0]\n", encoding="utf-8")
+    qasm(X_CIRCUIT, "ok.qasm")
+    path = manifest(_jobs_payload([{"id": "bad", "source": "bad.qasm"}]))
+    failed_payload = run_batch(path)
+
+    # Baseline claims success, the re-run actually fails.
+    succeeded_payload = {
+        "schema_version": 1,
+        "job_count": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "results": [
+            {
+                "id": "bad",
+                "status": "succeeded",
+                "output": {
+                    "schema_version": 1,
+                    "shots": 1024,
+                    "seed": 0,
+                    "num_qubits": 1,
+                    "num_clbits": 1,
+                    "counts": {"0": 1024},
+                },
+            }
+        ],
+    }
+    rc = cli.main(["reconcile", path, baseline(succeeded_payload, "succeeded.json")])
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 3
+    entry = data["results"][0]
+    assert entry["reason"] == "status_mismatch"
+    assert entry["expected"]["status"] == "succeeded"
+    assert entry["actual"]["status"] == "failed"
+    assert entry["actual"]["error"]["error"] == "parse_error"
+
+    # Baseline claims failure; fix the circuit so the re-run succeeds.
+    bad.write_text(HEADER + X_CIRCUIT, encoding="utf-8")
+    rc = cli.main(["reconcile", path, baseline(failed_payload, "failed.json")])
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 3
+    entry = data["results"][0]
+    assert entry["reason"] == "status_mismatch"
+    assert entry["expected"]["status"] == "failed"
+    assert entry["actual"]["status"] == "succeeded"
+    assert entry["actual"]["output"]["counts"] == {"1": 1024}
+
+
+def test_reconcile_task_file_disappearing_is_status_mismatch(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 3, "seed": 1}]))
+    base_path = baseline(run_batch(path))
+    (tmp_path / "a.qasm").unlink()
+
+    rc = cli.main(["reconcile", path, base_path])
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert captured.err == ""
+    entry = json.loads(captured.out)["results"][0]
+    assert entry["reason"] == "status_mismatch"
+    assert entry["actual"]["error"]["error"] == "io_error"
+
+
+def test_reconcile_ignores_key_order_and_whitespace(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, _baseline, baseline_text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 6, "seed": 2}]))
+    payload = run_batch(path)
+    # Re-serialise with indentation and sorted (different) key order.
+    base_path = baseline_text(json.dumps(payload, indent=4, sort_keys=True))
+
+    rc = cli.main(["reconcile", path, base_path])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert json.loads(captured.out)["consistent"] is True
+
+
+def test_reconcile_array_order_and_number_type_are_significant():
+    assert cli._json_equal({"a": [1, 2]}, {"a": [1, 2]}) is True
+    assert cli._json_equal({"a": [1, 2]}, {"a": [2, 1]}) is False
+    assert cli._json_equal({"a": 1}, {"a": 1}) is True
+    assert cli._json_equal({"a": 1}, {"a": 1.0}) is False
+    assert cli._json_equal({"a": 1}, {"a": True}) is False
+    assert cli._json_equal({"x": 1, "y": 2}, {"y": 2, "x": 1}) is True
+
+
+def test_reconcile_byte_identical_repeated_runs(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    qasm(BELL, "bell.qasm")
+    path = manifest(_jobs_payload([{"id": "b", "source": "bell.qasm", "shots": 30, "seed": 7}]))
+    base_path = baseline(run_batch(path))
+
+    outputs = set()
+    for _ in range(3):
+        assert cli.main(["reconcile", path, base_path]) == 0
+        outputs.add(capsys.readouterr().out)
+    assert len(outputs) == 1
+
+
+def test_reconcile_relative_paths_anchor_at_manifest_directory(reconcile_env, capsys, monkeypatch):
+    tmp_path, qasm, model, _manifest, baseline, _text, run_batch = reconcile_env
+    sub = tmp_path / "nested"
+    sub.mkdir()
+    qasm(X_CIRCUIT, "nested/c.qasm")
+    model({"depolarizing": 0.2}, "nested/m.json")
+    manifest_path = sub / "jobs.json"
+    manifest_path.write_text(
+        json.dumps(_jobs_payload([{"id": "j", "source": "c.qasm", "shots": 5, "noise_model": "m.json"}])),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    batch_output = run_batch(str(manifest_path))
+    base_path = sub / "baseline.json"
+    base_path.write_text(json.dumps(batch_output), encoding="utf-8")
+
+    assert cli.main(["reconcile", str(manifest_path), str(base_path)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_reconcile_stdin_inputs(reconcile_env, capsys, monkeypatch):
+    import io
+
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "cwd.qasm")
+    monkeypatch.chdir(tmp_path)
+    jobs_text = json.dumps(_jobs_payload([{"id": "j", "source": "cwd.qasm", "shots": 4, "seed": 1}]))
+    manifest_path = manifest(json.loads(jobs_text))
+    batch_output = run_batch(manifest_path)
+
+    # Baseline from stdin.
+    monkeypatch.setattr(cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(json.dumps(batch_output).encode())))
+    assert cli.main(["reconcile", manifest_path, "-"]) == 0
+    assert capsys.readouterr().err == ""
+
+    # Manifest from stdin.
+    base_path = baseline(batch_output)
+    monkeypatch.setattr(cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(jobs_text.encode())))
+    assert cli.main(["reconcile", "-", base_path]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_reconcile_both_stdin_rejected_without_reading(monkeypatch, capsys):
+    class _ExplodingStdin:
+        class buffer:
+            @staticmethod
+            def read():
+                raise AssertionError("standard input must not be read")
+
+    monkeypatch.setattr(cli.sys, "stdin", _ExplodingStdin())
+    rc = cli.main(["reconcile", "-", "-"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["error"] == "reconciliation_error"
+    assert "input" not in payload
+    assert captured.err.count("\n") == 1
+
+
+@pytest.mark.parametrize("side", ["manifest", "baseline"])
+def test_reconcile_missing_file_is_io_error_with_input(reconcile_env, capsys, side):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 2}]))
+    base_path = baseline(run_batch(path))
+    args = ["reconcile", path, base_path]
+    args[1 if side == "manifest" else 2] = "/nonexistent/missing.json"
+
+    rc = cli.main(args)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["error"] == "io_error"
+    assert payload["input"] == side
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+@pytest.mark.parametrize("side", ["manifest", "baseline"])
+def test_reconcile_unreadable_file_is_io_error_with_input(reconcile_env, capsys, side):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 2}]))
+    base_path = baseline(run_batch(path))
+    target = tmp_path / ("secret_manifest.json" if side == "manifest" else "secret_baseline.json")
+    target.write_text("{}", encoding="utf-8")
+    target.chmod(0o000)
+    try:
+        args = ["reconcile", path, base_path]
+        args[1 if side == "manifest" else 2] = str(target)
+        rc = cli.main(args)
+    finally:
+        target.chmod(0o644)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert json.loads(captured.err)["input"] == side
+
+
+@pytest.mark.parametrize("side", ["manifest", "baseline"])
+def test_reconcile_invalid_utf8_is_io_error_with_input(reconcile_env, capsys, side):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 2}]))
+    base_path = baseline(run_batch(path))
+    bad = tmp_path / ("utf8_manifest.json" if side == "manifest" else "utf8_baseline.json")
+    bad.write_bytes(b'{"schema_version": 1}\xff')
+    args = ["reconcile", path, base_path]
+    args[1 if side == "manifest" else 2] = str(bad)
+
+    rc = cli.main(args)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["error"] == "io_error"
+    assert payload["input"] == side
+
+
+def test_reconcile_manifest_io_error_reported_before_baseline(reconcile_env, capsys):
+    _tmp, _q, _m, _manifest, _b, _t, _run = reconcile_env
+    rc = cli.main(["reconcile", "/no/such/manifest.json", "/no/such/baseline.json"])
+    assert rc == 1
+    assert json.loads(capsys.readouterr().err)["input"] == "manifest"
+
+
+def test_reconcile_invalid_manifest_is_reconcile_input_error(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    good_jobs = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 2}]), "good.json")
+    base_path = baseline(run_batch(good_jobs))
+    bad_manifest = manifest({"schema_version": 1, "jobs": []}, "empty.json")
+
+    rc = cli.main(["reconcile", bad_manifest, base_path])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"] == "reconcile_input_error"
+
+
+def test_reconcile_manifest_duplicate_id_rejected(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    good_jobs = manifest(_jobs_payload([{"id": "a", "source": "a.qasm"}]), "good.json")
+    base_path = baseline(run_batch(good_jobs))
+    bad_manifest = manifest(
+        _jobs_payload(
+            [
+                {"id": "a", "source": "a.qasm"},
+                {"id": "a", "source": "a.qasm"},
+            ]
+        ),
+        "dup.json",
+    )
+    rc = cli.main(["reconcile", bad_manifest, base_path])
+    assert rc == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "reconcile_input_error"
+
+
+def _valid_baseline():
+    return {
+        "schema_version": 1,
+        "job_count": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "results": [
+            {
+                "id": "a",
+                "status": "succeeded",
+                "output": {
+                    "schema_version": 1,
+                    "shots": 4,
+                    "seed": 0,
+                    "num_qubits": 1,
+                    "num_clbits": 1,
+                    "counts": {"1": 4},
+                },
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d.pop("schema_version"),
+        lambda d: d.update(schema_version=2),
+        lambda d: d.update(schema_version="1"),
+        lambda d: d.update(extra=1),
+        lambda d: d.update(job_count=2),
+        lambda d: d.update(succeeded=0, failed=1),
+        lambda d: d.update(results="x"),
+        lambda d: d.update(results=[]),
+        lambda d: d["results"].append(dict(d["results"][0])),
+        lambda d: d["results"][0].update(status="bogus"),
+        lambda d: d["results"][0].update(id="b"),
+        lambda d: d["results"][0].update(id=""),
+        lambda d: d["results"][0].update(id=1),
+        lambda d: d["results"][0].update(error={"error": "io_error", "message": "x"}),
+        lambda d: d["results"][0].pop("output"),
+        lambda d: d["results"][0]["output"].pop("shots"),
+        lambda d: d["results"][0]["output"].update(extra=1),
+        lambda d: d["results"][0]["output"].update(shots=0),
+        lambda d: d["results"][0]["output"].update(shots=4.0),
+        lambda d: d["results"][0]["output"].update(num_qubits=0),
+        lambda d: d["results"][0]["output"].update(num_qubits=21),
+        lambda d: d["results"][0]["output"]["counts"].update({"02": 4}),
+        lambda d: d["results"][0]["output"]["counts"].update({"1": 3, "0": 2}),
+        lambda d: d["results"][0]["output"]["counts"].clear(),
+    ],
+)
+def test_reconcile_invalid_baseline_structure(reconcile_env, capsys, mutate):
+    tmp_path, qasm, _model, manifest, baseline, _text, _run = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 4}]))
+    payload = _valid_baseline()
+    mutate(payload)
+
+    rc = cli.main(["reconcile", path, baseline(payload)])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"] == "reconcile_input_error"
+    assert captured.err.count("\n") == 1
+
+
+def test_reconcile_failed_baseline_error_validation(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, _run = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm"}]))
+
+    def _payload():
+        return {
+            "schema_version": 1,
+            "job_count": 1,
+            "succeeded": 0,
+            "failed": 1,
+            "results": [{"id": "a", "status": "failed", "error": error}],
+        }
+
+    for error in (
+        "io_error",
+        {"error": "unknown_error", "message": "x"},
+        {"error": "io_error"},
+        {"error": "io_error", "message": 1},
+        {"error": "io_error", "message": "x", "line": 1},
+        {"error": "parse_error", "message": "x"},
+        {"error": "parse_error", "message": "x", "line": 1, "column": 0},
+        {"error": "parse_error", "message": "x", "line": 1, "column": 1, "input": "left"},
+    ):
+        payload = _payload()
+        if isinstance(error, str):
+            payload["results"][0]["error"] = error
+        rc = cli.main(["reconcile", path, baseline(payload)])
+        assert rc == 2
+        assert json.loads(capsys.readouterr().err)["error"] == "reconcile_input_error"
+
+
+def test_reconcile_noisy_output_validation(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, _run = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 4}]))
+    good_noise_output = {
+        "schema_version": 2,
+        "shots": 4,
+        "seed": 0,
+        "num_qubits": 1,
+        "num_clbits": 1,
+        "noise_model": {"bit_flip": 0.5},
+        "counts": {"1": 4},
+    }
+
+    bad = _valid_baseline()
+    bad["results"][0]["output"] = dict(good_noise_output, noise_model={"nope": 0.5})
+    assert cli.main(["reconcile", path, baseline(bad, "b1.json")]) == 2
+    capsys.readouterr()
+
+    bad = _valid_baseline()
+    bad["results"][0]["output"] = dict(good_noise_output, noise_model={"bit_flip": 2})
+    assert cli.main(["reconcile", path, baseline(bad, "b2.json")]) == 2
+    capsys.readouterr()
+
+    # Schema v1 output must not carry a noise model.
+    bad = _valid_baseline()
+    bad["results"][0]["output"]["noise_model"] = {"bit_flip": 0.5}
+    assert cli.main(["reconcile", path, baseline(bad, "b3.json")]) == 2
+    capsys.readouterr()
+
+    # Noisy results above 10 qubits cannot be produced by batch-simulate.
+    big = _valid_baseline()
+    big["results"][0]["output"] = dict(
+        good_noise_output, num_qubits=11, num_clbits=11, counts={"00000000000": 4}
+    )
+    assert cli.main(["reconcile", path, baseline(big, "b4.json")]) == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "reconcile_input_error"
+
+
+def test_reconcile_job_count_mismatch(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, _run = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    qasm(X_CIRCUIT, "b.qasm")
+    path = manifest(
+        _jobs_payload(
+            [
+                {"id": "a", "source": "a.qasm", "shots": 4},
+                {"id": "b", "source": "b.qasm", "shots": 4},
+            ]
+        )
+    )
+    payload = _valid_baseline()  # claims a single job "a"
+    rc = cli.main(["reconcile", path, baseline(payload)])
+    assert rc == 2
+    assert "job_count" in json.loads(capsys.readouterr().err)["message"]
+
+
+def test_reconcile_duplicate_baseline_id(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, _run = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(
+        _jobs_payload(
+            [
+                {"id": "a", "source": "a.qasm", "shots": 4},
+                {"id": "b", "source": "a.qasm", "shots": 4},
+            ]
+        )
+    )
+    payload = _valid_baseline()
+    payload.update(job_count=2, succeeded=2, failed=0)
+    payload["results"].append(json.loads(json.dumps(payload["results"][0])))
+    payload["results"][1]["id"] = "a"
+
+    rc = cli.main(["reconcile", path, baseline(payload)])
+    assert rc == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "reconcile_input_error"
+
+
+def test_reconcile_baseline_json_syntax_and_constants(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, _baseline, baseline_text, run_batch = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 4}]))
+
+    rc = cli.main(["reconcile", path, baseline_text('{"schema_version": 1, "results": [')])
+    assert rc == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "reconcile_input_error"
+
+    raw = json.dumps(_valid_baseline()).replace('"shots": 4', '"shots": NaN')
+    rc = cli.main(["reconcile", path, baseline_text(raw, "nan.json")])
+    assert rc == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "reconcile_input_error"
+
+    raw = json.dumps(_valid_baseline()).replace('"shots": 4', '"shots": 1e999')
+    rc = cli.main(["reconcile", path, baseline_text(raw, "inf.json")])
+    assert rc == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "reconcile_input_error"
+
+
+def test_reconcile_duplicate_baseline_json_key(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, _baseline, baseline_text, _run = reconcile_env
+    qasm(X_CIRCUIT, "a.qasm")
+    path = manifest(_jobs_payload([{"id": "a", "source": "a.qasm", "shots": 4}]))
+    raw = json.dumps(_valid_baseline()).replace(
+        '"job_count": 1', '"job_count": 1, "job_count": 1', 1
+    )
+    rc = cli.main(["reconcile", path, baseline_text(raw)])
+    assert rc == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "reconcile_input_error"
+
+
+def test_reconcile_validates_before_reading_task_files(reconcile_env, capsys):
+    tmp_path, qasm, _model, manifest, baseline, _text, _run = reconcile_env
+    # The referenced task files do not exist; an invalid baseline must still
+    # surface reconcile_input_error, never an embedded task failure.
+    path = manifest(_jobs_payload([{"id": "a", "source": "missing.qasm"}]))
+    rc = cli.main(["reconcile", path, baseline({"schema_version": 1})])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert json.loads(captured.err)["error"] == "reconcile_input_error"
+
+
+def test_process_reconcile_end_to_end(tmp_path):
+    (tmp_path / "c.qasm").write_text(HEADER + X_CIRCUIT, encoding="utf-8")
+    manifest = tmp_path / "jobs.json"
+    manifest.write_text(
+        json.dumps(_jobs_payload([{"id": "j", "source": "c.qasm", "shots": 6}])),
+        encoding="utf-8",
+    )
+    batch = _run_process("batch-simulate", str(manifest))
+    assert batch.returncode == 0
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(batch.stdout, encoding="utf-8")
+
+    result = _run_process("reconcile", str(manifest), str(baseline))
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert result.stdout.count("\n") == 1
+    data = json.loads(result.stdout)
+    assert data["consistent"] is True and data["matched"] == 1
+
+
+def test_process_reconcile_mismatch_exit_code(tmp_path):
+    (tmp_path / "c.qasm").write_text(HEADER + X_CIRCUIT, encoding="utf-8")
+    manifest = tmp_path / "jobs.json"
+    manifest.write_text(
+        json.dumps(_jobs_payload([{"id": "j", "source": "c.qasm", "shots": 6}])),
+        encoding="utf-8",
+    )
+    batch = _run_process("batch-simulate", str(manifest))
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(batch.stdout.replace('"1": 6', '"1": 5, "0": 1'), encoding="utf-8")
+
+    result = _run_process("reconcile", str(manifest), str(baseline))
+    assert result.returncode == 3
+    assert result.stderr == ""
+    assert json.loads(result.stdout)["results"][0]["reason"] == "output_mismatch"
+
+
+def test_process_reconcile_both_stdin_exit_code():
+    result = _run_process("reconcile", "-", "-")
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["error"] == "reconciliation_error"
+
+
+def test_process_reconcile_missing_baseline_exit_code(tmp_path):
+    manifest = tmp_path / "jobs.json"
+    manifest.write_text(json.dumps(_jobs_payload([{"id": "a", "source": "x.qasm"}])), encoding="utf-8")
+    result = _run_process("reconcile", str(manifest), "/no/such/baseline.json")
+    assert result.returncode == 1
+    payload = json.loads(result.stderr)
+    assert payload["error"] == "io_error" and payload["input"] == "baseline"

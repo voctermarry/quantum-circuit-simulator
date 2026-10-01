@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、按清单批量执行独立仿真的 `batch-simulate` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、按清单批量执行独立仿真的 `batch-simulate` 入口、按清单重跑并与历史批量结果对账的 `reconcile` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
 
 ## 环境与安装
 
@@ -27,6 +27,7 @@ quantum-circuit-simulator version                # 打印版本号
 quantum-circuit-simulator --help                 # 打印用法
 quantum-circuit-simulator simulate circuit.qasm  # 仿真并采样
 quantum-circuit-simulator batch-simulate jobs.json  # 按清单批量仿真
+quantum-circuit-simulator reconcile jobs.json baseline.json  # 重跑清单并与历史结果对账
 quantum-circuit-simulator equivalent a.qasm b.qasm  # 判断两份线路是否同一变换
 quantum-circuit-simulator optimize circuit.qasm     # 化简为确定的规范线路
 quantum-circuit-simulator state-metrics a.qasm b.qasm  # 比较末态并量化单量子位纠缠
@@ -88,6 +89,34 @@ quantum-circuit-simulator batch-simulate MANIFEST
 - `results` 保持清单顺序，每项先含 `id` 与 `status`。成功项 `status` 为 `succeeded`，`output` 与相同参数单独执行 `simulate` 的成功对象完全一致；失败项 `status` 为 `failed`，并含 `error` 对象。
 - 全部任务成功时退出码为 0；存在任务级失败时仍返回完整汇总，退出码为 3。
 - 每个任务从自身的 `seed` 独立初始化 RNG，其他任务的增删或换序不改变其 `output`；同一清单、文件内容与参数的重复调用产生字节一致的 stdout。
+
+### reconcile 子命令
+
+```bash
+quantum-circuit-simulator reconcile MANIFEST BASELINE
+```
+
+- `MANIFEST`：与 `batch-simulate` 完全相同的 UTF-8 JSON 清单（格式、字段、默认值、相对路径基准与任务隔离语义一致）；`-` 表示从标准输入读取。
+- `BASELINE`：既有 `batch-simulate` 输出的 UTF-8 JSON 批量结果文件；`-` 表示从标准输入读取。两者不能同时为 `-`（违反时不读取标准输入，stderr 输出单行 `reconciliation_error`，退出码 2）。
+- 任一文件不可读或不是合法 UTF-8 时，stderr 输出带 `input`（值为 `manifest` 或 `baseline`）的单行 `io_error`，退出码 1；按 MANIFEST、BASELINE 顺序报告首个错误。
+- 读取任何任务文件之前，两份输入都必须完整校验通过：
+  - 清单的校验规则与 `batch-simulate` 一致；任何语法或结构问题统一报 `reconcile_input_error`（退出码 2），而非 `batch_input_error`。
+  - 基线必须是 `schema_version` 为 1 的批量结果：根字段齐全且无未知键，`job_count`、`succeeded`、`failed` 与 `results` 自洽（计数非负、和相等、与各项状态一致）；结果 `id` 非空、唯一，且任务数量、`id` 与顺序逐项与清单对应。
+  - 成功项只能有合法 `output`（字段、类型、计数与 shots、测量串宽度、噪声模型通道与概率、噪声任务 10 量子位上限等均须合法），失败项只能有合法 `error`（错误名取自任务级错误集合，`parse_error`/`validation_error` 必须带从 1 开始的 `line`、`column`，其余错误不带位置）。
+  - JSON 语法错误、重复或未知键、结构或类型错误、非有限数（含 `NaN`/`Infinity` 常量与越界浮点）、自洽性或与清单的对应关系无效，都令整个请求失败：stdout 为空，stderr 输出单行 `reconcile_input_error`，退出码 2。
+- 两份输入校验通过后，按清单顺序重跑全部任务；任务读取、解析、噪声、量子位限制、采样与任务级错误完全沿用 `batch-simulate`，任务错误仍嵌入结果而不写 stderr。成功与失败都参与比较：忽略对象键顺序与输入空白；数组顺序或字段值（含整数与浮点之别）不同即判不一致。
+
+成功（对账报告本身总能产出）时 stdout 只输出一行 JSON，字段顺序固定为 `schema_version`、`job_count`、`matched`、`mismatched`、`consistent`、`results`，其中 `schema_version` 为 1：
+
+```json
+{"schema_version": 1, "job_count": 2, "matched": 1, "mismatched": 1, "consistent": false, "results": [{"id": "a", "consistent": true, "reason": "identical"}, {"id": "b", "consistent": false, "reason": "output_mismatch", "expected": {"id": "b", "status": "succeeded", "output": {"schema_version": 1, "shots": 20, "seed": 2, "num_qubits": 2, "num_clbits": 2, "counts": {"00": 9, "11": 11}}}, "actual": {"id": "b", "status": "succeeded", "output": {"schema_version": 1, "shots": 20, "seed": 2, "num_qubits": 2, "num_clbits": 2, "counts": {"00": 8, "11": 12}}}]}
+```
+
+- 汇总须与 `results` 自洽：`matched + mismatched = job_count`，全部一致时 `consistent` 为 `true`。
+- `results` 保持清单顺序。每项依次含 `id`、`consistent`、`reason`；`reason` 仅为 `identical`、`status_mismatch`、`output_mismatch`、`error_mismatch` 之一。一致项只含这三个字段。
+- 不一致项再含 `expected` 与 `actual`，分别保留完整的基线任务结果与当前重跑任务结果（含 `id`、`status` 及 `output` 或 `error`）。
+- 全部一致退出码为 0；存在差异时仍输出完整报告，退出码为 3 且 stderr 为空。
+- 命令不创建或修改任何文件；相同输入内容重复执行产生字节一致的 stdout。
 
 ### equivalent 子命令
 
@@ -224,6 +253,10 @@ measure q[i] -> c[k];
 | `batch-simulate` 清单文件不存在、不可读或不是合法 UTF-8 | 1 | `io_error` |
 | `batch-simulate` 清单 JSON 语法错误，或结构/类型/数值不合规（未知或重复键、字段缺失、`id` 为空或重复、`jobs` 数量越界、`shots` 非正整数、`seed` 非整数、路径为 `-` 等；此时不读取任何任务文件） | 2 | `batch_input_error` |
 | `batch-simulate` 存在任务级失败（清单本身有效；汇总 JSON 仍写入 stdout，错误嵌入对应结果） | 3 | 结果内为 `io_error` / `parse_error` / `validation_error` / `noise_model_error` / `simulation_error` |
+| `reconcile` 清单或基线文件不存在、不可读或不是合法 UTF-8 | 1 | `io_error`（带 `input`：`manifest`/`baseline`） |
+| `reconcile` 清单与基线同时取 `-`（此时不读取标准输入） | 2 | `reconciliation_error` |
+| `reconcile` 任一输入 JSON 语法错误、重复或未知键、结构/类型/数值不合规（含非有限数）、基线不自洽或与清单的任务数量/`id`/顺序不一致（此时不读取任何任务文件） | 2 | `reconcile_input_error` |
+| `reconcile` 存在不一致任务（两份输入均有效；完整对账报告仍写入 stdout，任务级错误只嵌入结果） | 3 | 报告内 `reason` 为 `status_mismatch` / `output_mismatch` / `error_mismatch` |
 | `equivalent` 任一侧文件不存在、不可读或不是合法 UTF-8 | 1 | `io_error`（带 `input`：`left`/`right`） |
 | `equivalent` 两侧同时取 `-`（此时不读取标准输入） | 2 | `comparison_error` |
 | `equivalent` 任一侧词法/语法或语义错误 | 2 | `parse_error` / `validation_error`（带 `input`：`left`/`right`，按 LEFT、RIGHT 顺序报告首个错误） |
@@ -240,7 +273,7 @@ measure q[i] -> c[k];
 
 ## 现有公开接口
 
-- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`batch-simulate`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
+- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
 - Python 包 `quantum_circuit`，其 `__version__` 为当前版本号
 
 ## 限制
