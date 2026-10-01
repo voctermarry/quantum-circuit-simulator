@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、按清单批量执行独立仿真的 `batch-simulate` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
 
 ## 环境与安装
 
@@ -26,6 +26,7 @@ python -m pytest
 quantum-circuit-simulator version                # 打印版本号
 quantum-circuit-simulator --help                 # 打印用法
 quantum-circuit-simulator simulate circuit.qasm  # 仿真并采样
+quantum-circuit-simulator batch-simulate jobs.json  # 按清单批量仿真
 quantum-circuit-simulator equivalent a.qasm b.qasm  # 判断两份线路是否同一变换
 quantum-circuit-simulator optimize circuit.qasm     # 化简为确定的规范线路
 quantum-circuit-simulator state-metrics a.qasm b.qasm  # 比较末态并量化单量子位纠缠
@@ -63,6 +64,31 @@ quantum-circuit-simulator simulate SOURCE [--shots N] [--seed S] [--noise-model 
 每个量子门完成后，对该门涉及的量子位施加配置的通道；`cx` 的两位按下标升序处理，同一位固定按 `amplitude_damping`、`phase_damping`、`bit_flip`、`depolarizing` 的顺序处理。采样取最终密度矩阵的对角概率，噪声演化不消耗 seed。
 
 成功输出字段顺序为 `schema_version`、`shots`、`seed`、`num_qubits`、`num_clbits`、`noise_model`、`counts`，其中 `schema_version` 为 2；`noise_model` 按固定通道顺序仅回显已给概率，模型的空白与键顺序不影响输出。
+
+### batch-simulate 子命令
+
+```bash
+quantum-circuit-simulator batch-simulate MANIFEST
+```
+
+- `MANIFEST`：UTF-8 编码的 JSON 清单文件路径；`-` 表示从标准输入读取。清单根对象只允许 `schema_version` 与 `jobs` 两个键：`schema_version` 必须为整数 `1`，`jobs` 为 1 至 100 项的数组。
+- 每个任务对象只允许 `id`、`source`、`shots`、`seed`、`noise_model`：
+  - `id`：必填，批内唯一的非空字符串。
+  - `source`：必填，OpenQASM 源文件路径，不能为 `-`。相对路径以清单文件所在目录为基准；清单从标准输入读取时以当前工作目录为基准。
+  - `shots`、`seed`、`noise_model` 可省略，默认值与约束与 `simulate` 相同（`shots` 默认 1024 且为正整数，`seed` 默认 0 且为整数，`noise_model` 为噪声模型文件路径且不能为 `-`）。
+- 读取任何任务文件之前先完整校验清单：未知或重复键、字段缺失、`id` 重复、类型错误、数值越界均令请求失败。
+- 清单有效后按清单顺序处理全部任务，每个任务从自身的 `seed` 初始化 RNG；其他任务的增删或换序不影响本任务结果，无噪声与带噪声任务可混排。单项失败不影响后续任务，失败错误（含 `parse_error`/`validation_error` 的 line、column 等既有位置字段）只嵌入对应结果。
+- 命令不创建结果文件，也不修改输入。
+
+成功时 stdout 输出单行 JSON，顶层字段顺序固定为 `schema_version`、`job_count`、`succeeded`、`failed`、`results`，其中 `schema_version` 为 1：
+
+```json
+{"schema_version": 1, "job_count": 2, "succeeded": 2, "failed": 0, "results": [{"id": "a", "status": "succeeded", "output": {"schema_version": 1, "shots": 50, "seed": 7, "num_qubits": 2, "num_clbits": 2, "counts": {"00": 29, "11": 21}}}, {"id": "b", "status": "failed", "error": {"error": "io_error", "message": "cannot read source 'x.qasm': No such file or directory"}}]}
+```
+
+- `results` 保持清单顺序；每项先含 `id` 与 `status`。成功项 `status` 为 `succeeded`，其 `output` 与相同参数单独执行 `simulate` 的成功对象完全一致；失败项 `status` 为 `failed`，并含 `error` 对象（错误名称、message 及位置字段沿用 `simulate`）。
+- 全部成功退出码为 0；存在任务级失败时仍输出完整汇总，退出码为 3，且 stderr 为空。
+- 同一清单、文件内容与参数的重复调用产生字节一致的 stdout。
 
 ### equivalent 子命令
 
@@ -209,10 +235,13 @@ measure q[i] -> c[k];
 | `estimate` 词法/语法或语义错误（带源码位置） | 2 | `parse_error` / `validation_error` |
 | `estimate` 非法 `--mode`（不读取 SOURCE） | 2 | 参数用法错误 |
 | `--shots`/`--seed` 等命令行参数错误（不读取输入） | 2 | 参数用法错误 |
+| `batch-simulate` 清单文件不存在、不可读或不是合法 UTF-8 | 1 | `io_error` |
+| `batch-simulate` 清单 JSON 语法错误（含 NaN/Infinity、重复键）或结构非法（未知/缺失键、`schema_version` 非 1、`jobs` 非 1 至 100 项数组、`id` 缺失/为空/重复、类型错误、`shots` 非正整数、`seed` 非整数、`source`/`noise_model` 为 `-` 等；读取任务文件前完整校验） | 2 | `batch_input_error` |
+| `batch-simulate` 单个任务失败（io/parse/validation/noise_model/simulation 错误均嵌入对应结果，不写 stderr，后续任务继续） | 汇总退出码 3 | 结果内 `error` 沿用 `simulate` 的错误名称 |
 
 ## 现有公开接口
 
-- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
+- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`batch-simulate`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
 - Python 包 `quantum_circuit`，其 `__version__` 为当前版本号
 
 ## 限制
