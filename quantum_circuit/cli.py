@@ -13,6 +13,7 @@ from .equivalence import (
     measurement_layout,
     unitary_distance,
 )
+from .estimate import MODE_QUBIT_LIMITS, estimate as estimate_program
 from .metrics import single_qubit_entropies, state_fidelity
 from .noise import (
     MAX_NOISE_QUBITS,
@@ -190,6 +191,24 @@ def _optimize(source_arg: str) -> int:
         "qasm": qasm,
     }
     sys.stdout.write(json.dumps(result) + "\n")
+    return 0
+
+
+def _estimate(source_arg: str, mode: str) -> int:
+    source = _read_source(source_arg)
+    if source is None:
+        return 1
+
+    try:
+        program = parse(source)
+    except ParseError as exc:
+        _emit_error("parse_error", exc.message, exc.line, exc.column)
+        return 2
+    except ValidationError as exc:
+        _emit_error("validation_error", exc.message, exc.line, exc.column)
+        return 2
+
+    sys.stdout.write(json.dumps(estimate_program(program, mode)) + "\n")
     return 0
 
 
@@ -393,6 +412,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     optimize_parser.add_argument("source", help="path to the OpenQASM source file, or '-' for stdin")
 
+    estimate_parser = sub.add_parser(
+        "estimate",
+        help="estimate circuit size and execution feasibility without simulating",
+    )
+    estimate_parser.add_argument("source", help="path to the OpenQASM source file, or '-' for stdin")
+    estimate_parser.add_argument(
+        "--mode",
+        choices=list(MODE_QUBIT_LIMITS),
+        default="state-vector",
+        help="execution mode to estimate for (default: state-vector)",
+    )
+
     metrics_parser = sub.add_parser(
         "state-metrics",
         help="compare the noiseless final states of two circuits and measure per-qubit entanglement",
@@ -414,6 +445,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "optimize":
         return _optimize(args.source)
+
+    if args.command == "estimate":
+        return _estimate(args.source, args.mode)
 
     if args.command == "state-metrics":
         return _state_metrics(args.left, args.right)

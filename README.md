@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口，以及比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口，以及只解析分析、不演化线路的规模与可执行性预估入口 `estimate`。
 
 ## 环境与安装
 
@@ -29,6 +29,7 @@ quantum-circuit-simulator simulate circuit.qasm  # 仿真并采样
 quantum-circuit-simulator equivalent a.qasm b.qasm  # 判断两份线路是否同一变换
 quantum-circuit-simulator optimize circuit.qasm     # 化简为确定的规范线路
 quantum-circuit-simulator state-metrics a.qasm b.qasm  # 比较末态并量化单量子位纠缠
+quantum-circuit-simulator estimate circuit.qasm        # 预估线路规模与可执行性（不仿真）
 ```
 
 ### simulate 子命令
@@ -140,6 +141,28 @@ quantum-circuit-simulator optimize SOURCE
 - 结果线路与原线路在 `equivalent` 的口径下等价（允许全局相位，测量布局一致）。
 - `qasm` 固定按版本声明、`include`、寄存器、门、测量逐项换行输出并以换行结尾；旋转角使用最多 17 位有效数字的十进制或小写科学计数法（最短可往返表示），负零写成 `0`。相同输入重复调用产生字节一致的 JSON；没有量子门时也正常返回。
 
+### estimate 子命令
+
+```bash
+quantum-circuit-simulator estimate SOURCE [--mode state-vector|density-matrix|unitary]
+```
+
+- `SOURCE`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取。
+- `--mode`：预估的执行模式，默认 `state-vector`；非法取值以退出码 2 拒绝且不读取 `SOURCE`。
+- 只解析并分析线路，不演化、不采样，也不分配指数规模的状态或矩阵。
+
+成功时 stdout 输出单行 JSON，字段顺序固定为 `schema_version`、`mode`、`num_qubits`、`num_clbits`、`gate_count`、`measurement_count`、`gate_counts`、`circuit_depth`、`entry_count`、`complex_payload_bytes`、`supported`、`qubit_limit`，其中 `schema_version` 为 1：
+
+```json
+{"schema_version": 1, "mode": "state-vector", "num_qubits": 2, "num_clbits": 2, "gate_count": 2, "measurement_count": 2, "gate_counts": {"x": 0, "h": 1, "cx": 1, "rx": 0, "ry": 0, "rz": 0}, "circuit_depth": 2, "entry_count": 4, "complex_payload_bytes": 64, "supported": true, "qubit_limit": 20}
+```
+
+- `gate_count` 只统计测量之前的量子门；`gate_counts` 按 `x`、`h`、`cx`、`rx`、`ry`、`rz` 顺序给出各门数量。
+- `circuit_depth`：按源码顺序处理，每个门的层数为所涉量子位已有最大层数加一，互不相交的门可同层；测量不计深度。
+- `entry_count`：`state-vector` 为 2 的量子位数次方，其余两种模式为 4 的量子位数次方；`complex_payload_bytes` 等于 `entry_count` 乘 16（每个复数的载荷字节数）。
+- 三种模式的 `qubit_limit` 分别为 20、10、8；未超限时 `supported` 为 `true`，否则为 `false`。超限仍返回完整估算（退出码 0），不启动计算。
+- 相同输入参数重复调用产生字节一致的 JSON。
+
 ### 支持的 OpenQASM 2.0 子集
 
 ```
@@ -183,14 +206,17 @@ measure q[i] -> c[k];
 | `state-metrics` 任一侧词法/语法或语义错误（含寄存器大小越限） | 2 | `parse_error` / `validation_error`（带 `input`：`left`/`right`，按 LEFT、RIGHT 顺序报告首个错误） |
 | `optimize` 的 SOURCE 不存在、不可读或不是合法 UTF-8 | 1 | `io_error` |
 | `optimize` 词法/语法或语义错误（带源码位置） | 2 | `parse_error` / `validation_error` |
+| `estimate` 的 SOURCE 不存在、不可读或不是合法 UTF-8 | 1 | `io_error` |
+| `estimate` 词法/语法或语义错误（带源码位置） | 2 | `parse_error` / `validation_error` |
+| `estimate` 的 `--mode` 非法（不读取 SOURCE） | 2 | 参数用法错误 |
 | `--shots`/`--seed` 等命令行参数错误（不读取输入） | 2 | 参数用法错误 |
 
 ## 现有公开接口
 
-- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`equivalent`、`optimize` 与 `state-metrics` 子命令）
+- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
 - Python 包 `quantum_circuit`，其 `__version__` 为当前版本号
 
 ## 限制
 
 - 仅支持 OpenQASM 2.0 的上述子集：`x`、`h`、`cx` 与参数化门 `rx`、`ry`、`rz`，以及按位测量，不支持条件执行或多寄存器。
-- 状态向量随量子位数指数增长，寄存器大小上限为 20；密度矩阵噪声仿真上限为 10 个量子位；`equivalent` 稠密酉矩阵比较上限为 8 个量子位；`state-metrics` 基于状态向量，沿用 20 个量子位的寄存器上限。
+- 状态向量随量子位数指数增长，寄存器大小上限为 20；密度矩阵噪声仿真上限为 10 个量子位；`equivalent` 稠密酉矩阵比较上限为 8 个量子位；`state-metrics` 基于状态向量，沿用 20 个量子位的寄存器上限；`estimate` 只做静态分析，三种模式的 `qubit_limit` 分别为 20、10、8，超限仍返回估算。
