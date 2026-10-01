@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、比较两份线路是否等价的 `equivalent` 入口，以及把线路化简为确定规范结果的 `optimize` 入口。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口，以及比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口。
 
 ## 环境与安装
 
@@ -28,6 +28,7 @@ quantum-circuit-simulator --help                 # 打印用法
 quantum-circuit-simulator simulate circuit.qasm  # 仿真并采样
 quantum-circuit-simulator equivalent a.qasm b.qasm  # 判断两份线路是否同一变换
 quantum-circuit-simulator optimize circuit.qasm     # 化简为确定的规范线路
+quantum-circuit-simulator state-metrics a.qasm b.qasm  # 比较末态并量化单量子位纠缠
 ```
 
 ### simulate 子命令
@@ -95,6 +96,26 @@ quantum-circuit-simulator equivalent LEFT RIGHT
 
 失败时（退出码非 0）stdout 为空，stderr 输出单行 JSON，错误对象带 `input` 字段标明出错的一侧（`left` 或 `right`）；两侧都有问题时按 LEFT、RIGHT 顺序报告首个错误。
 
+### state-metrics 子命令
+
+```bash
+quantum-circuit-simulator state-metrics LEFT RIGHT
+```
+
+- `LEFT`、`RIGHT`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取，但两侧不能同时为 `-`（此时不读取标准输入）。
+- 两份无噪声线路各自从全零初态演化（忽略末尾测量，不要求测量布局一致），比较所得末态并量化每个量子位与其余系统的纠缠。
+- 量子位数相同时 `reason` 为 `compared`，`fidelity` 为归一化末态内积的模平方 `|<left|right>|²`；量子位数不同时 `reason` 为 `qubit_count_mismatch`，`fidelity` 为 `null`，但两侧熵数组仍照常计算。
+- 熵数组按量子位下标升序，每项为该量子位约化密度矩阵以 2 为底的冯诺依曼熵（零本征值不贡献）：乘积态为 0，Bell 态的两个量子位均为 1。
+- 所有数值限制在定义域 `[0, 1]` 内：绝对值不超过 `1e-15` 时输出 `0`，与 1 的差不超过 `1e-15` 时输出 `1`，不会出现 NaN、Infinity 或负零；相同输入重复调用产生字节一致的 JSON。
+
+成功时 stdout 输出单行 JSON，字段顺序固定为 `schema_version`、`left_num_qubits`、`right_num_qubits`、`reason`、`fidelity`、`left_single_qubit_entropy`、`right_single_qubit_entropy`，其中 `schema_version` 为 1：
+
+```json
+{"schema_version": 1, "left_num_qubits": 2, "right_num_qubits": 2, "reason": "compared", "fidelity": 1.0, "left_single_qubit_entropy": [1.0, 1.0], "right_single_qubit_entropy": [1.0, 1.0]}
+```
+
+失败时（退出码非 0）stdout 为空，stderr 输出单行 JSON，错误对象带 `input` 字段标明出错的一侧（`left` 或 `right`）；两侧都有问题时按 LEFT、RIGHT 顺序报告首个错误。超过寄存器大小上限（20 个量子位）按 `validation_error` 处理。
+
 ### optimize 子命令
 
 ```bash
@@ -155,13 +176,16 @@ measure q[i] -> c[k];
 | `equivalent` 两侧同时取 `-`（此时不读取标准输入） | 2 | `comparison_error` |
 | `equivalent` 任一侧词法/语法或语义错误 | 2 | `parse_error` / `validation_error`（带 `input`：`left`/`right`，按 LEFT、RIGHT 顺序报告首个错误） |
 | `equivalent` 任一侧线路超过 8 个量子位 | 3 | `simulation_error`（带 `input`：`left`/`right`） |
+| `state-metrics` 任一侧文件不存在、不可读或不是合法 UTF-8 | 1 | `io_error`（带 `input`：`left`/`right`） |
+| `state-metrics` 两侧同时取 `-`（此时不读取标准输入） | 2 | `metrics_error` |
+| `state-metrics` 任一侧词法/语法或语义错误（含寄存器大小越限） | 2 | `parse_error` / `validation_error`（带 `input`：`left`/`right`，按 LEFT、RIGHT 顺序报告首个错误） |
 | `optimize` 的 SOURCE 不存在、不可读或不是合法 UTF-8 | 1 | `io_error` |
 | `optimize` 词法/语法或语义错误（带源码位置） | 2 | `parse_error` / `validation_error` |
 | `--shots`/`--seed` 等命令行参数错误（不读取输入） | 2 | 参数用法错误 |
 
 ## 现有公开接口
 
-- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`equivalent` 与 `optimize` 子命令）
+- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`equivalent`、`optimize` 与 `state-metrics` 子命令）
 - Python 包 `quantum_circuit`，其 `__version__` 为当前版本号
 
 ## 限制
