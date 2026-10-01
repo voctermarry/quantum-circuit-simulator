@@ -7,6 +7,13 @@ import json
 import sys
 
 from . import __version__
+from .equivalence import (
+    MAX_EQUIVALENCE_QUBITS,
+    TOLERANCE,
+    circuit_unitary,
+    measurement_layout,
+    unitary_distance,
+)
 from .noise import (
     MAX_NOISE_QUBITS,
     NoiseModelError,
@@ -27,8 +34,16 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _emit_error(error: str, message: str, line: int | None = None, column: int | None = None) -> None:
+def _emit_error(
+    error: str,
+    message: str,
+    line: int | None = None,
+    column: int | None = None,
+    input_side: str | None = None,
+) -> None:
     payload: dict[str, object] = {"error": error, "message": message}
+    if input_side is not None:
+        payload["input"] = input_side
     if line is not None:
         payload["line"] = line
         payload["column"] = column
@@ -124,6 +139,75 @@ def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | Non
     return 0
 
 
+def _equivalent(left_arg: str, right_arg: str) -> int:
+    if left_arg == "-" and right_arg == "-":
+        _emit_error(
+            "comparison_error",
+            "left and right inputs cannot both be read from standard input",
+        )
+        return 2
+
+    programs = []
+    for side, source_arg in (("left", left_arg), ("right", right_arg)):
+        try:
+            if source_arg == "-":
+                data = sys.stdin.buffer.read()
+            else:
+                with open(source_arg, "rb") as handle:
+                    data = handle.read()
+        except OSError as exc:
+            _emit_error("io_error", f"cannot read {side} source {source_arg!r}: {exc.strerror or exc}")
+            return 1
+
+        try:
+            source = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            _emit_error("io_error", f"{side} source {source_arg!r} is not valid UTF-8: {exc}")
+            return 1
+
+        try:
+            programs.append(parse(source))
+        except ParseError as exc:
+            _emit_error("parse_error", exc.message, exc.line, exc.column, input_side=side)
+            return 2
+        except ValidationError as exc:
+            _emit_error("validation_error", exc.message, exc.line, exc.column, input_side=side)
+            return 2
+
+    left, right = programs
+    for side, program in (("left", left), ("right", right)):
+        if program.num_qubits > MAX_EQUIVALENCE_QUBITS:
+            _emit_error(
+                "simulation_error",
+                f"equivalence comparison supports at most {MAX_EQUIVALENCE_QUBITS} qubits, "
+                f"{side} input has {program.num_qubits}",
+            )
+            return 3
+
+    result: dict[str, object] = {"schema_version": 1}
+    if left.num_qubits != right.num_qubits:
+        result["equivalent"] = False
+        result["reason"] = "qubit_count_mismatch"
+        distance: float | None = None
+    else:
+        distance = unitary_distance(circuit_unitary(left), circuit_unitary(right))
+        if distance > TOLERANCE:
+            result["equivalent"] = False
+            result["reason"] = "unitary_distance"
+        elif measurement_layout(left) != measurement_layout(right):
+            result["equivalent"] = False
+            result["reason"] = "measurement_layout_mismatch"
+        else:
+            result["equivalent"] = True
+            result["reason"] = "equivalent"
+    result["left_num_qubits"] = left.num_qubits
+    result["right_num_qubits"] = right.num_qubits
+    result["distance"] = distance
+    result["tolerance"] = TOLERANCE
+    sys.stdout.write(json.dumps(result) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="quantum-circuit-simulator",
@@ -143,6 +227,12 @@ def main(argv: list[str] | None = None) -> int:
         help="optional JSON noise model for density-matrix simulation ('-' reads stdin)",
     )
 
+    equivalent_parser = sub.add_parser(
+        "equivalent", help="check whether two noiseless OpenQASM circuits are equivalent"
+    )
+    equivalent_parser.add_argument("left", help="path to the left OpenQASM source file, or '-' for stdin")
+    equivalent_parser.add_argument("right", help="path to the right OpenQASM source file, or '-' for stdin")
+
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -151,6 +241,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "simulate":
         return _simulate(args.source, args.shots, args.seed, args.noise_model)
+
+    if args.command == "equivalent":
+        return _equivalent(args.left, args.right)
 
     parser.print_help()
     return 0

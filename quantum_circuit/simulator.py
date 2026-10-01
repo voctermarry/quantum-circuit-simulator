@@ -81,19 +81,14 @@ def _rz(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None
             state[index] = lo_factor * state[index]
 
 
-def simulate_state_vector(program: Program) -> list[complex]:
-    """Return the final state vector after applying all quantum gates.
+def apply_gates(program: Program, state: list[complex]) -> None:
+    """Apply every quantum gate of *program* to *state* in place.
 
-    Basis-state integer ``k`` stores qubit ``i`` in bit ``i`` (q[0] is the
-    least significant bit). Measurements do not collapse the state: the spec
-    guarantees every measurement comes after every gate and each qubit is
-    measured at most once, so non-destructive sampling of the final state is
-    equivalent.
+    Measurements are ignored: the spec guarantees every measurement comes
+    after every gate and each qubit is measured at most once, so they affect
+    only the sampled classical outcomes, not the state.
     """
     n = program.num_qubits
-    state = [0j] * (1 << n)
-    state[0] = 1 + 0j
-
     for op in program.operations:
         if op.kind == "x":
             _pauli_x(state, op.targets[0], n)
@@ -108,6 +103,21 @@ def simulate_state_vector(program: Program) -> list[complex]:
         elif op.kind == "rz":
             _rz(state, op.targets[0], n, op.params[0])
         # "measure" operations affect only the sampled classical outcomes.
+
+
+def simulate_state_vector(program: Program) -> list[complex]:
+    """Return the final state vector after applying all quantum gates.
+
+    Basis-state integer ``k`` stores qubit ``i`` in bit ``i`` (q[0] is the
+    least significant bit). Measurements do not collapse the state: the spec
+    guarantees every measurement comes after every gate and each qubit is
+    measured at most once, so non-destructive sampling of the final state is
+    equivalent.
+    """
+    n = program.num_qubits
+    state = [0j] * (1 << n)
+    state[0] = 1 + 0j
+    apply_gates(program, state)
     return state
 
 

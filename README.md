@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`，以及无噪声线路等价性比较入口 `equivalent`。
 
 ## 环境与安装
 
@@ -60,6 +60,25 @@ quantum-circuit-simulator simulate SOURCE [--shots N] [--seed S] [--noise-model 
 
 成功输出字段顺序为 `schema_version`、`shots`、`seed`、`num_qubits`、`num_clbits`、`noise_model`、`counts`，其中 `schema_version` 为 2；`noise_model` 按固定通道顺序仅回显已给概率，模型的空白与键顺序不影响输出。
 
+### equivalent 子命令
+
+```bash
+quantum-circuit-simulator equivalent LEFT RIGHT
+```
+
+- `LEFT`、`RIGHT`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取，但两端不能同时取 `-`（此时不读取标准输入，返回 `comparison_error`、退出码 2）。
+- 解析沿用 `simulate` 的语法、门集、角表达式、寄存器及测量约束；寄存器名称不影响比较。
+- 比较覆盖所有输入态：量子位数相同时，以测量前的门定义酉变换，允许全局相位，距离为 `d = min(|λ|=1) ||U-λV||_F / sqrt(2×2^n)`，`d` 不大于固定容差 `1e-10` 才算变换相同；完全等价还要求经典寄存器宽度及量子位到经典位的测量映射一致。
+- 该入口最多比较 8 个量子位，任一侧超限返回 `simulation_error`、退出码 3。
+
+成功时（退出码 0）stdout 输出单行 JSON，字段顺序固定为 `schema_version`（恒为 1）、`equivalent`、`reason`、`left_num_qubits`、`right_num_qubits`、`distance`、`tolerance`：
+
+```json
+{"schema_version": 1, "equivalent": true, "reason": "equivalent", "left_num_qubits": 2, "right_num_qubits": 2, "distance": 0.0, "tolerance": 1e-10}
+```
+
+`reason` 取值：`equivalent`（完全等价）、`unitary_distance`（距离超限）、`measurement_layout_mismatch`（变换相同但测量布局不同，保留距离）、`qubit_count_mismatch`（量子位数不同，`distance` 为 `null`）。结果可重复，不受空白、注释或声明名称影响。语法与语义错误分别在 stderr 输出 `parse_error` 或 `validation_error`（退出码 2），并以 `input` 字段标明 `left` 或 `right`，按 LEFT、RIGHT 顺序报告首个错误。
+
 ### 支持的 OpenQASM 2.0 子集
 
 ```
@@ -94,14 +113,16 @@ measure q[i] -> c[k];
 | 重复声明、寄存器越界或大小非法、名称未声明、重复测量、测量后仍有量子门、角表达式中出现 `pi` 以外的名称、除以零、数值字面量溢出或结果非有限数等（带源码位置） | 2 | `validation_error` |
 | 噪声模型内容不合规（非法 UTF-8/JSON、非对象、空对象、未知键、重复键、概率非 0 到 1 的有限数字）或线路与模型同时取 `-`（此时不读取标准输入） | 2 | `noise_model_error` |
 | 带噪声线路超过 10 个量子位 | 3 | `simulation_error` |
+| `equivalent` 任一线路超过 8 个量子位 | 3 | `simulation_error` |
+| `equivalent` 两端同时取 `-`（此时不读取标准输入） | 2 | `comparison_error` |
 | `--shots`/`--seed` 等命令行参数错误（不读取输入） | 2 | 参数用法错误 |
 
 ## 现有公开接口
 
-- 命令行程序 `quantum-circuit-simulator`（`version` 与 `simulate` 子命令）
+- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate` 与 `equivalent` 子命令）
 - Python 包 `quantum_circuit`，其 `__version__` 为当前版本号
 
 ## 限制
 
 - 仅支持 OpenQASM 2.0 的上述子集：`x`、`h`、`cx` 与参数化门 `rx`、`ry`、`rz`，以及按位测量，不支持条件执行或多寄存器。
-- 状态向量随量子位数指数增长，寄存器大小上限为 20；密度矩阵噪声仿真上限为 10 个量子位。
+- 状态向量随量子位数指数增长，寄存器大小上限为 20；密度矩阵噪声仿真上限为 10 个量子位；等价性比较上限为 8 个量子位。
