@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -371,6 +372,437 @@ def _batch_simulate(manifest_arg: str) -> int:
     return 0 if succeeded == len(jobs) else 3
 
 
+# ----------------------------------------------------------------- reconcile
+
+RECONCILE_SCHEMA_VERSION = 1
+_BASELINE_ROOT_KEYS = ("schema_version", "job_count", "succeeded", "failed", "results")
+_BASELINE_RESULT_KEYS = ("id", "status", "output", "error")
+_SIM_OUTPUT_KEYS = (
+    "schema_version",
+    "shots",
+    "seed",
+    "num_qubits",
+    "num_clbits",
+    "noise_model",
+    "counts",
+)
+_ERROR_OBJECT_KEYS = ("error", "input", "message", "line", "column")
+_ERROR_NAMES = (
+    "io_error",
+    "parse_error",
+    "validation_error",
+    "noise_model_error",
+    "simulation_error",
+)
+_NOISE_CHANNELS = ("amplitude_damping", "phase_damping", "bit_flip", "depolarizing")
+
+
+class _ReconcileInputError(Exception):
+    """One of the two reconcile inputs is structurally invalid."""
+
+
+def _reject_baseline_constant(value: str) -> None:
+    raise _ReconcileInputError(f"baseline contains non-JSON constant {value!r}")
+
+
+def _baseline_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _ReconcileInputError(f"duplicate key {key!r} in baseline")
+        result[key] = value
+    return result
+
+
+def _is_finite_json_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value))
+
+
+def _validate_finite(value: object, where: str) -> None:
+    """Reject booleans, non-numbers and non-finite numbers recursively."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _validate_finite(item, f"{where}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_finite(item, f"{where}[{index}]")
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise _ReconcileInputError(f"{where} is not a finite number")
+
+
+def _validate_simulate_output(output: object, where: str) -> None:
+    """Validate the success ``output`` payload produced by ``simulate``."""
+    if not isinstance(output, dict):
+        raise _ReconcileInputError(f"{where} must be a JSON object")
+    for key in output:
+        if key not in _SIM_OUTPUT_KEYS:
+            raise _ReconcileInputError(f"{where} has unknown key {key!r}")
+
+    required = ("schema_version", "shots", "seed", "num_qubits", "num_clbits", "counts")
+    for key in required:
+        if key not in output:
+            raise _ReconcileInputError(f"{where} is missing required key {key!r}")
+
+    schema_version = output["schema_version"]
+    if not _is_json_int(schema_version) or schema_version not in (1, 2):
+        raise _ReconcileInputError(f"{where}.schema_version must be the integer 1 or 2")
+
+    for key in ("shots", "num_qubits", "num_clbits"):
+        value = output[key]
+        if not _is_json_int(value) or value <= 0:
+            raise _ReconcileInputError(f"{where}.{key} must be a positive integer")
+
+    seed = output["seed"]
+    if not _is_json_int(seed):
+        raise _ReconcileInputError(f"{where}.seed must be an integer")
+
+    counts = output["counts"]
+    if not isinstance(counts, dict) or not counts:
+        raise _ReconcileInputError(f"{where}.counts must be a non-empty JSON object")
+    total = 0
+    for bitstring, count in counts.items():
+        if not isinstance(bitstring, str) or not bitstring:
+            raise _ReconcileInputError(f"{where}.counts has an invalid bitstring key")
+        if any(bit not in "01" for bit in bitstring):
+            raise _ReconcileInputError(f"{where}.counts key {bitstring!r} is not a binary string")
+        if len(bitstring) != output["num_clbits"]:
+            raise _ReconcileInputError(
+                f"{where}.counts key {bitstring!r} does not match num_clbits"
+            )
+        if not _is_json_int(count) or count < 0:
+            raise _ReconcileInputError(f"{where}.counts[{bitstring!r}] must be a non-negative integer")
+        total += count
+    if total != output["shots"]:
+        raise _ReconcileInputError(f"{where}.counts do not sum to shots")
+
+    if schema_version == 2:
+        if "noise_model" not in output:
+            raise _ReconcileInputError(f"{where} is missing required key 'noise_model'")
+        noise_model = output["noise_model"]
+        if not isinstance(noise_model, dict) or not noise_model:
+            raise _ReconcileInputError(f"{where}.noise_model must configure at least one channel")
+        for channel, probability in noise_model.items():
+            if channel not in _NOISE_CHANNELS:
+                raise _ReconcileInputError(f"{where}.noise_model has unknown channel {channel!r}")
+            if not _is_finite_json_number(probability) or not 0.0 <= float(probability) <= 1.0:
+                raise _ReconcileInputError(
+                    f"{where}.noise_model.{channel} must be a finite number between 0 and 1"
+                )
+    elif "noise_model" in output:
+        raise _ReconcileInputError(f"{where}.noise_model is only valid with schema_version 2")
+
+    _validate_finite(output, where)
+
+
+def _validate_error_object(error: object, where: str) -> None:
+    """Validate the ``error`` payload embedded in a failed batch result."""
+    if not isinstance(error, dict):
+        raise _ReconcileInputError(f"{where} must be a JSON object")
+    for key in error:
+        if key not in _ERROR_OBJECT_KEYS:
+            raise _ReconcileInputError(f"{where} has unknown key {key!r}")
+
+    if "error" not in error:
+        raise _ReconcileInputError(f"{where} is missing required key 'error'")
+    name = error["error"]
+    if not isinstance(name, str) or name not in _ERROR_NAMES:
+        raise _ReconcileInputError(f"{where}.error must name a known task error")
+
+    if "message" not in error or not isinstance(error["message"], str):
+        raise _ReconcileInputError(f"{where}.message must be a string")
+
+    if "input" in error and not isinstance(error["input"], str):
+        raise _ReconcileInputError(f"{where}.input must be a string")
+
+    has_line = "line" in error
+    has_column = "column" in error
+    if has_line != has_column:
+        raise _ReconcileInputError(f"{where} must carry line and column together")
+    if has_line and name not in ("parse_error", "validation_error"):
+        raise _ReconcileInputError(f"{where}.line is only valid for parse/validation errors")
+    if has_line:
+        line = error["line"]
+        column = error["column"]
+        if not _is_json_int(line) or line < 1:
+            raise _ReconcileInputError(f"{where}.line must be a positive integer")
+        if not _is_json_int(column) or column < 1:
+            raise _ReconcileInputError(f"{where}.column must be a positive integer")
+
+    _validate_finite(error, where)
+
+
+def _validate_baseline(data: object, expected_jobs: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Validate a batch-simulate result against the manifest's jobs.
+
+    Checks schema_version, the self-consistency of the summary counters, the
+    shape and content of every result entry, and that the job count, ids and
+    order match *expected_jobs*. Returns the raw result entries in order.
+    """
+    if not isinstance(data, dict):
+        raise _ReconcileInputError("baseline must be a JSON object")
+    for key in data:
+        if key not in _BASELINE_ROOT_KEYS:
+            raise _ReconcileInputError(f"unknown baseline key {key!r}")
+
+    for key in _BASELINE_ROOT_KEYS:
+        if key not in data:
+            raise _ReconcileInputError(f"baseline is missing required key {key!r}")
+
+    schema_version = data["schema_version"]
+    if not _is_json_int(schema_version) or schema_version != RECONCILE_SCHEMA_VERSION:
+        raise _ReconcileInputError(
+            f"baseline schema_version must be {RECONCILE_SCHEMA_VERSION}, got {schema_version!r}"
+        )
+
+    for key in ("job_count", "succeeded", "failed"):
+        if not _is_json_int(data[key]) or data[key] < 0:
+            raise _ReconcileInputError(f"baseline {key} must be a non-negative integer")
+
+    results = data["results"]
+    if not isinstance(results, list):
+        raise _ReconcileInputError("baseline 'results' must be an array")
+
+    job_count = data["job_count"]
+    if job_count != len(results):
+        raise _ReconcileInputError("baseline job_count does not match the number of results")
+    if job_count != len(expected_jobs):
+        raise _ReconcileInputError("baseline job_count does not match the manifest job count")
+    if data["succeeded"] + data["failed"] != job_count:
+        raise _ReconcileInputError("baseline succeeded and failed do not sum to job_count")
+
+    succeeded = 0
+    seen_ids: set[str] = set()
+    for index, entry in enumerate(results):
+        where = f"baseline result at results[{index}]"
+        if not isinstance(entry, dict):
+            raise _ReconcileInputError(f"{where} must be a JSON object")
+        for key in entry:
+            if key not in _BASELINE_RESULT_KEYS:
+                raise _ReconcileInputError(f"{where} has unknown key {key!r}")
+
+        if "id" not in entry:
+            raise _ReconcileInputError(f"{where} is missing required key 'id'")
+        job_id = entry["id"]
+        if not isinstance(job_id, str) or not job_id:
+            raise _ReconcileInputError(f"{where} 'id' must be a non-empty string")
+        if job_id in seen_ids:
+            raise _ReconcileInputError(f"duplicate baseline result id {job_id!r}")
+        seen_ids.add(job_id)
+
+        expected_id = expected_jobs[index]["id"]
+        if job_id != expected_id:
+            raise _ReconcileInputError(
+                f"baseline results[{index}] id {job_id!r} does not match manifest id {expected_id!r}"
+            )
+
+        if "status" not in entry:
+            raise _ReconcileInputError(f"{where} is missing required key 'status'")
+        status = entry["status"]
+        keys = set(entry)
+        if status == "succeeded":
+            succeeded += 1
+            if "output" not in entry:
+                raise _ReconcileInputError(f"{where} is missing required key 'output'")
+            if "error" in entry:
+                raise _ReconcileInputError(f"{where} succeeded result must not carry an error")
+            if keys != {"id", "status", "output"}:
+                raise _ReconcileInputError(f"{where} succeeded result must contain only output")
+            _validate_simulate_output(entry["output"], f"{where}.output")
+        elif status == "failed":
+            if "error" not in entry:
+                raise _ReconcileInputError(f"{where} is missing required key 'error'")
+            if "output" in entry:
+                raise _ReconcileInputError(f"{where} failed result must not carry an output")
+            if keys != {"id", "status", "error"}:
+                raise _ReconcileInputError(f"{where} failed result must contain only error")
+            _validate_error_object(entry["error"], f"{where}.error")
+        else:
+            raise _ReconcileInputError(f"{where} status must be 'succeeded' or 'failed'")
+
+    if succeeded != data["succeeded"]:
+        raise _ReconcileInputError("baseline succeeded count does not match the result statuses")
+    if (job_count - succeeded) != data["failed"]:
+        raise _ReconcileInputError("baseline failed count does not match the result statuses")
+
+    return results
+
+
+def _read_reconcile_input(side: str, arg: str) -> tuple[str | None, bytes | None, int | None]:
+    """Read one reconcile input (``"manifest"`` or ``"baseline"``).
+
+    Returns ``(text, None, None)`` on success, or ``(None, payload, code)``
+    after preparing an ``io_error`` payload carrying ``input`` = *side*.
+    """
+    try:
+        if arg == "-":
+            data = sys.stdin.buffer.read()
+        else:
+            with open(arg, "rb") as handle:
+                data = handle.read()
+    except OSError as exc:
+        return None, _error_payload(
+            "io_error", f"cannot read {side} {arg!r}: {exc.strerror or exc}", side=side
+        ), 1
+
+    try:
+        return data.decode("utf-8"), None, None
+    except UnicodeDecodeError as exc:
+        return None, _error_payload(
+            "io_error", f"{side} {arg!r} is not valid UTF-8: {exc}", side=side
+        ), 1
+
+
+def _semantic_equal(expected: object, actual: object) -> bool:
+    """Compare parsed JSON ignoring object key order and whitespace.
+
+    Array order and primitive values are significant; numbers must be equal.
+    """
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        if set(expected) != set(actual):
+            return False
+        return all(_semantic_equal(expected[key], actual[key]) for key in expected)
+    if isinstance(expected, list) and isinstance(actual, list):
+        if len(expected) != len(actual):
+            return False
+        return all(_semantic_equal(left, right) for left, right in zip(expected, actual))
+    # Booleans are distinct from JSON numbers, even though Python treats
+    # True == 1; after that, plain numeric equality matches JSON semantics
+    # (0 and 0.0 are the same value) and covers strings and null.
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return isinstance(expected, bool) and isinstance(actual, bool) and expected == actual
+    return expected == actual
+
+
+def _reconcile(manifest_arg: str, baseline_arg: str) -> int:
+    # Standard input cannot feed both inputs; never read it in that case.
+    if manifest_arg == "-" and baseline_arg == "-":
+        _emit_error(
+            "reconciliation_error",
+            "manifest and baseline cannot both be read from standard input",
+        )
+        return 2
+
+    # Read, decode, parse and fully validate the manifest first, then the
+    # baseline against it (LEFT-then-RIGHT precedence, like the other
+    # two-input commands). No task file is touched until both pass.
+    manifest_text, payload, code = _read_reconcile_input("manifest", manifest_arg)
+    if manifest_text is None:
+        _emit_error_payload(payload)
+        return code
+
+    try:
+        manifest_data = json.loads(
+            manifest_text,
+            object_pairs_hook=_manifest_pairs,
+            parse_constant=_reject_manifest_constant,
+        )
+        jobs = _validate_batch_manifest(manifest_data)
+    except (json.JSONDecodeError, _BatchManifestError) as exc:
+        message = (
+            f"batch manifest is not valid JSON: {exc}"
+            if isinstance(exc, json.JSONDecodeError)
+            else str(exc)
+        )
+        _emit_error("reconcile_input_error", message)
+        return 2
+
+    baseline_text, payload, code = _read_reconcile_input("baseline", baseline_arg)
+    if baseline_text is None:
+        _emit_error_payload(payload)
+        return code
+
+    try:
+        baseline_data = json.loads(
+            baseline_text,
+            object_pairs_hook=_baseline_pairs,
+            parse_constant=_reject_baseline_constant,
+        )
+        baseline_results = _validate_baseline(baseline_data, jobs)
+    except (json.JSONDecodeError, _ReconcileInputError) as exc:
+        message = (
+            f"baseline is not valid JSON: {exc}"
+            if isinstance(exc, json.JSONDecodeError)
+            else str(exc)
+        )
+        _emit_error("reconcile_input_error", message)
+        return 2
+
+    if manifest_arg == "-":
+        base_dir = os.getcwd()
+    else:
+        base_dir = os.path.dirname(os.path.abspath(manifest_arg))
+
+    report_results: list[dict[str, object]] = []
+    matched = 0
+    for job, baseline_entry in zip(jobs, baseline_results):
+        output, error, _exit_code = _run_simulation(
+            job["source"],
+            job.get("shots", 1024),
+            job.get("seed", 0),
+            job.get("noise_model"),
+            base_dir=base_dir,
+        )
+
+        # "expected" reproduces the complete baseline entry; "actual" is the
+        # same shape produced from the freshly rerun task (both include id).
+        expected_entry: dict[str, object] = {"id": job["id"], "status": baseline_entry["status"]}
+        if "output" in baseline_entry:
+            expected_entry["output"] = baseline_entry["output"]
+        if "error" in baseline_entry:
+            expected_entry["error"] = baseline_entry["error"]
+
+        if error is None:
+            actual_entry = {"id": job["id"], "status": "succeeded", "output": output}
+        else:
+            actual_entry = {"id": job["id"], "status": "failed", "error": error}
+
+        if baseline_entry["status"] != actual_entry["status"]:
+            consistent = False
+            reason = "status_mismatch"
+        elif actual_entry["status"] == "succeeded":
+            if _semantic_equal(baseline_entry["output"], output):
+                consistent = True
+                reason = "identical"
+            else:
+                consistent = False
+                reason = "output_mismatch"
+        else:
+            if _semantic_equal(baseline_entry["error"], error):
+                consistent = True
+                reason = "identical"
+            else:
+                consistent = False
+                reason = "error_mismatch"
+
+        if consistent:
+            matched += 1
+            report_results.append({"id": job["id"], "consistent": True, "reason": reason})
+        else:
+            report_results.append(
+                {
+                    "id": job["id"],
+                    "consistent": False,
+                    "reason": reason,
+                    "expected": expected_entry,
+                    "actual": actual_entry,
+                }
+            )
+
+    mismatched = len(jobs) - matched
+    summary: dict[str, object] = {
+        "schema_version": RECONCILE_SCHEMA_VERSION,
+        "job_count": len(jobs),
+        "matched": matched,
+        "mismatched": mismatched,
+        "consistent": mismatched == 0,
+        "results": report_results,
+    }
+    sys.stdout.write(json.dumps(summary) + "\n")
+    return 0 if mismatched == 0 else 3
+
+
 def _read_source(source_arg: str) -> str | None:
     """Read a UTF-8 circuit source from a path or ``-`` (stdin).
 
@@ -669,6 +1101,19 @@ def main(argv: list[str] | None = None) -> int:
         help="path to the UTF-8 JSON batch manifest, or '-' for stdin",
     )
 
+    reconcile_parser = sub.add_parser(
+        "reconcile",
+        help="rerun a batch manifest and compare against a previous result",
+    )
+    reconcile_parser.add_argument(
+        "manifest",
+        help="path to the UTF-8 JSON batch manifest, or '-' for stdin",
+    )
+    reconcile_parser.add_argument(
+        "baseline",
+        help="path to the UTF-8 JSON baseline batch result, or '-' for stdin",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -680,6 +1125,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "batch-simulate":
         return _batch_simulate(args.manifest)
+
+    if args.command == "reconcile":
+        return _reconcile(args.manifest, args.baseline)
 
     if args.command == "equivalent":
         return _equivalent(args.left, args.right)
