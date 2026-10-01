@@ -117,9 +117,20 @@ def sample_counts(program: Program, state: list[complex], shots: int, seed: int)
     Returns a mapping from fixed-width classical bit strings (highest clbit
     index first) to occurrence counts. Only observed outcomes are present.
     """
+    probabilities = [abs(amplitude) ** 2 for amplitude in state]
+    return sample_counts_from_probabilities(program, probabilities, shots, seed)
+
+
+def sample_counts_from_probabilities(
+    program: Program, probabilities: list[float], shots: int, seed: int
+) -> dict[str, int]:
+    """Draw *shots* samples from explicit basis-state probabilities.
+
+    Used by the density-matrix path, which supplies the diagonal of the
+    final density matrix; sampling semantics match the state-vector path.
+    """
     measurements = [(op.targets[0], op.targets[1]) for op in program.operations if op.kind == "measure"]
 
-    probabilities = [abs(amplitude) ** 2 for amplitude in state]
     total = sum(probabilities)
     cumulative = []
     running = 0.0
