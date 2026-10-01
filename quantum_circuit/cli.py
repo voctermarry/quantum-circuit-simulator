@@ -20,6 +20,7 @@ from .noise import (
     simulate_density_matrix,
 )
 from .openqasm import ParseError, ValidationError, parse
+from .optimize import optimize_program
 from .simulator import sample_counts, sample_counts_from_probabilities, simulate_state_vector, unitary_matrix
 
 
@@ -135,6 +136,46 @@ def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | Non
             "noise_model": noise_model,
             "counts": counts,
         }
+    sys.stdout.write(json.dumps(result) + "\n")
+    return 0
+
+
+def _optimize(source_arg: str) -> int:
+    try:
+        if source_arg == "-":
+            data = sys.stdin.buffer.read()
+        else:
+            with open(source_arg, "rb") as handle:
+                data = handle.read()
+    except OSError as exc:
+        _emit_error("io_error", f"cannot read source {source_arg!r}: {exc.strerror or exc}")
+        return 1
+
+    try:
+        source = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _emit_error("io_error", f"source {source_arg!r} is not valid UTF-8: {exc}")
+        return 1
+
+    try:
+        program = parse(source)
+    except ParseError as exc:
+        _emit_error("parse_error", exc.message, exc.line, exc.column)
+        return 2
+    except ValidationError as exc:
+        _emit_error("validation_error", exc.message, exc.line, exc.column)
+        return 2
+
+    optimized = optimize_program(program)
+    result: dict[str, object] = {
+        "schema_version": 1,
+        "num_qubits": optimized.num_qubits,
+        "num_clbits": optimized.num_clbits,
+        "original_gate_count": optimized.original_gate_count,
+        "optimized_gate_count": optimized.optimized_gate_count,
+        "changed": optimized.changed,
+        "qasm": optimized.qasm,
+    }
     sys.stdout.write(json.dumps(result) + "\n")
     return 0
 
@@ -278,6 +319,12 @@ def main(argv: list[str] | None = None) -> int:
     equivalent_parser.add_argument("left", help="path to the left OpenQASM source file, or '-' for stdin")
     equivalent_parser.add_argument("right", help="path to the right OpenQASM source file, or '-' for stdin")
 
+    optimize_parser = sub.add_parser(
+        "optimize",
+        help="simplify an OpenQASM circuit into a deterministic canonical form",
+    )
+    optimize_parser.add_argument("source", help="path to the OpenQASM source file, or '-' for stdin")
+
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -289,6 +336,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "equivalent":
         return _equivalent(args.left, args.right)
+
+    if args.command == "optimize":
+        return _optimize(args.source)
 
     parser.print_help()
     return 0

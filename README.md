@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`，以及比较两份线路是否等价的 `equivalent` 入口。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`，比较两份线路是否等价的 `equivalent` 入口，以及把线路化简为确定规范形式的 `optimize` 入口。
 
 ## 环境与安装
 
@@ -27,6 +27,7 @@ quantum-circuit-simulator version                # 打印版本号
 quantum-circuit-simulator --help                 # 打印用法
 quantum-circuit-simulator simulate circuit.qasm  # 仿真并采样
 quantum-circuit-simulator equivalent a.qasm b.qasm  # 判断两份线路是否同一变换
+quantum-circuit-simulator optimize circuit.qasm  # 化简为规范形式
 ```
 
 ### simulate 子命令
@@ -93,6 +94,26 @@ quantum-circuit-simulator equivalent LEFT RIGHT
 - `qubit_count_mismatch`：两侧量子位数不同，此时 `distance` 为 `null` 且不构造酉矩阵。
 
 失败时（退出码非 0）stdout 为空，stderr 输出单行 JSON，错误对象带 `input` 字段标明出错的一侧（`left` 或 `right`）；两侧都有问题时按 LEFT、RIGHT 顺序报告首个错误。
+
+### optimize 子命令
+
+```bash
+quantum-circuit-simulator optimize SOURCE
+```
+
+- `SOURCE`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取。
+- 把线路化简为确定的规范形式：同一依赖链上成对的 `x`、`h` 以及控制位和目标位相同的 `cx` 消去（两门之间仅有与所用量子位不相交的门时视为相邻）；同一量子位同轴的 `rx`、`ry`、`rz` 合并，角度规范到 `(-pi, pi]`，绝对值不超过 `1e-12` 的旋转删除，接近 `pi` 的 `rx`、`ry` 不替换为 `x`；互不共享量子位的门按最小量子位、最大量子位、门名和参数文本稳定重排，其余门保留依赖顺序。化简与重排持续至稳定，仅独立门书写顺序不同的输入产生字节一致的输出。
+- 规范线路统一使用 `q`、`c` 作为寄存器名，保留尺寸与量子位到经典位的测量映射，测量按经典位、量子位下标升序输出；结果在 `equivalent` 口径下与原线路等价（含全局相位容忍与测量布局）。
+
+成功时 stdout 输出单行 JSON，字段顺序固定为 `schema_version`、`num_qubits`、`num_clbits`、`original_gate_count`、`optimized_gate_count`、`changed`、`qasm`，其中 `schema_version` 为 1：
+
+```json
+{"schema_version": 1, "num_qubits": 1, "num_clbits": 1, "original_gate_count": 2, "optimized_gate_count": 0, "changed": true, "qasm": "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[1];\ncreg c[1];\nmeasure q[0] -> c[0];\n"}
+```
+
+门数只统计测量前的量子门；`changed` 表示门序列是否变化；`qasm` 是完整线路文本，按版本声明、include、寄存器、门、测量逐项换行并以换行结尾，旋转角使用最多 17 位有效数字的十进制或小写科学计数法（负零写成 `0`），可被现有解析器重读。相同输入重复调用产生字节一致的输出；没有量子门的线路也正常返回。
+
+错误处理与 `simulate` 相同：源文件不存在、不可读或不是合法 UTF-8 时退出码为 1，stderr 单行 JSON 的 `error` 为 `io_error`；词法、语法和语义错误为 `parse_error` 或 `validation_error`（带源码位置），退出码为 2；命令行参数错误以退出码 2 结束且不读取输入。所有失败的 stdout 为空。
 
 ### 支持的 OpenQASM 2.0 子集
 
