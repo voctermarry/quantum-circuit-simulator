@@ -1,4 +1,4 @@
-"""State-vector simulation and deterministic shot sampling."""
+"""State-vector and density-matrix simulation with deterministic shot sampling."""
 
 from __future__ import annotations
 
@@ -6,9 +6,14 @@ import cmath
 import math
 import random
 
-from .openqasm import Program
+from .noise import channel_kraus
+from .openqasm import Operation, Program
 
 _SQRT1_2 = 2.0**-0.5
+
+# A density matrix has 4**n entries; noisy simulation is capped well below
+# the state-vector register limit to keep it tractable.
+MAX_NOISE_QUBITS = 10
 
 
 def _hadamard(state: list[complex], qubit: int, num_qubits: int) -> None:
@@ -117,9 +122,16 @@ def sample_counts(program: Program, state: list[complex], shots: int, seed: int)
     Returns a mapping from fixed-width classical bit strings (highest clbit
     index first) to occurrence counts. Only observed outcomes are present.
     """
+    probabilities = [abs(amplitude) ** 2 for amplitude in state]
+    return _sample_from_probabilities(program, probabilities, shots, seed)
+
+
+def _sample_from_probabilities(
+    program: Program, probabilities: list[float], shots: int, seed: int
+) -> dict[str, int]:
+    """Draw *shots* samples from basis-state *probabilities* deterministically."""
     measurements = [(op.targets[0], op.targets[1]) for op in program.operations if op.kind == "measure"]
 
-    probabilities = [abs(amplitude) ** 2 for amplitude in state]
     total = sum(probabilities)
     cumulative = []
     running = 0.0
@@ -152,3 +164,132 @@ def sample_counts(program: Program, state: list[complex], shots: int, seed: int)
         counts[key] = counts.get(key, 0) + 1
 
     return dict(sorted(counts.items()))
+
+
+# ----------------------------------------------------------- density matrices
+
+
+def _gate_matrix(op: Operation) -> tuple[tuple[complex, ...], ...]:
+    """Return the 2x2 unitary of a single-qubit gate operation."""
+    kind = op.kind
+    if kind == "x":
+        return ((0, 1), (1, 0))
+    if kind == "h":
+        return ((_SQRT1_2, _SQRT1_2), (_SQRT1_2, -_SQRT1_2))
+    theta = op.params[0]
+    c = math.cos(theta / 2)
+    s = math.sin(theta / 2)
+    if kind == "rx":
+        return ((c, -1j * s), (-1j * s, c))
+    if kind == "ry":
+        return ((c, -s), (s, c))
+    if kind == "rz":
+        return ((cmath.exp(-0.5j * theta), 0), (0, cmath.exp(0.5j * theta)))
+    raise ValueError(f"not a single-qubit gate: {kind!r}")
+
+
+# cx with qubits ordered (control, target): pattern bit 0 is the control,
+# bit 1 the target, so only |10> and |11> (patterns 1 and 3) are swapped.
+_CX_MATRIX = (
+    (1, 0, 0, 0),
+    (0, 0, 0, 1),
+    (0, 0, 1, 0),
+    (0, 1, 0, 0),
+)
+
+
+def _superoperator(ops: list[tuple[tuple[complex, ...], ...]], dim: int) -> list[tuple[int, int, int, int, complex]]:
+    """Compile Kraus *ops* into sparse superoperator entries.
+
+    Each entry ``(i, j, p, q, coef)`` contributes ``coef * rho[p][q]`` to
+    ``rho'[i][j]`` within the extracted block, i.e. ``coef`` is
+    ``sum_K K[i][p] * conj(K[j][q])``. Zero coefficients are dropped.
+    """
+    entries = []
+    for i in range(dim):
+        for j in range(dim):
+            for p in range(dim):
+                for q in range(dim):
+                    coef = 0j
+                    for matrix in ops:
+                        coef += matrix[i][p] * matrix[j][q].conjugate()
+                    if coef:
+                        entries.append((i, j, p, q, coef))
+    return entries
+
+
+def _apply_superoperator(
+    rho: list[list[complex]],
+    num_qubits: int,
+    qubits: tuple[int, ...],
+    entries: list[tuple[int, int, int, int, complex]],
+) -> None:
+    """Apply a sparse superoperator acting on *qubits* to *rho* in place."""
+    size = 1 << num_qubits
+    dim = 1 << len(qubits)
+    masks = []
+    for pattern in range(dim):
+        mask = 0
+        for k, qubit in enumerate(qubits):
+            if (pattern >> k) & 1:
+                mask |= 1 << qubit
+        masks.append(mask)
+    involved = 0
+    for qubit in qubits:
+        involved |= 1 << qubit
+    rest = [index for index in range(size) if not index & involved]
+
+    for rest_row in rest:
+        rows = [rest_row | masks[p] for p in range(dim)]
+        rho_rows = [rho[row] for row in rows]
+        for rest_col in rest:
+            cols = [rest_col | masks[q] for q in range(dim)]
+            block = [[rho_rows[p][cols[q]] for q in range(dim)] for p in range(dim)]
+            new = [[0j] * dim for _ in range(dim)]
+            for i, j, p, q, coef in entries:
+                new[i][j] += coef * block[p][q]
+            for p in range(dim):
+                row = rho_rows[p]
+                for q in range(dim):
+                    row[cols[q]] = new[p][q]
+
+
+def simulate_density_matrix(program: Program, noise: dict[str, float]) -> list[list[complex]]:
+    """Return the final density matrix with *noise* applied after every gate.
+
+    The state starts as ``|0...0><0...0|``. After each quantum gate, every
+    configured channel is applied to the qubits the gate acts on: for ``cx``
+    the two qubits are processed in ascending index order, and for each qubit
+    the channels run in the fixed order amplitude_damping, phase_damping,
+    bit_flip, depolarizing. The evolution is fully deterministic and does not
+    consume any randomness.
+    """
+    n = program.num_qubits
+    size = 1 << n
+    rho = [[0j] * size for _ in range(size)]
+    rho[0][0] = 1 + 0j
+
+    channels = [(name, _superoperator(channel_kraus(name, p), 2)) for name, p in noise.items()]
+    cx_super = _superoperator([_CX_MATRIX], 4)
+
+    for op in program.operations:
+        if op.kind == "measure":
+            continue
+        if op.kind == "cx":
+            _apply_superoperator(rho, n, op.targets, cx_super)
+            noise_qubits = sorted(op.targets)
+        else:
+            _apply_superoperator(rho, n, op.targets, _superoperator([_gate_matrix(op)], 2))
+            noise_qubits = op.targets
+        for qubit in noise_qubits:
+            for _name, entries in channels:
+                _apply_superoperator(rho, n, (qubit,), entries)
+    return rho
+
+
+def sample_counts_noisy(
+    program: Program, rho: list[list[complex]], shots: int, seed: int
+) -> dict[str, int]:
+    """Draw *shots* samples from the diagonal of density matrix *rho*."""
+    probabilities = [rho[index][index].real for index in range(1 << program.num_qubits)]
+    return _sample_from_probabilities(program, probabilities, shots, seed)
