@@ -6,7 +6,7 @@ import cmath
 import math
 import random
 
-from .openqasm import Program
+from .openqasm import Operation, Program
 
 _SQRT1_2 = 2.0**-0.5
 
@@ -81,6 +81,22 @@ def _rz(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None
             state[index] = lo_factor * state[index]
 
 
+def _apply_gate(state: list[complex], op: Operation, num_qubits: int) -> None:
+    """Apply one (non-measurement) *op* to *state* in place."""
+    if op.kind == "x":
+        _pauli_x(state, op.targets[0], num_qubits)
+    elif op.kind == "h":
+        _hadamard(state, op.targets[0], num_qubits)
+    elif op.kind == "cx":
+        _controlled_x(state, op.targets[0], op.targets[1], num_qubits)
+    elif op.kind == "rx":
+        _rx(state, op.targets[0], num_qubits, op.params[0])
+    elif op.kind == "ry":
+        _ry(state, op.targets[0], num_qubits, op.params[0])
+    elif op.kind == "rz":
+        _rz(state, op.targets[0], num_qubits, op.params[0])
+
+
 def simulate_state_vector(program: Program) -> list[complex]:
     """Return the final state vector after applying all quantum gates.
 
@@ -95,20 +111,36 @@ def simulate_state_vector(program: Program) -> list[complex]:
     state[0] = 1 + 0j
 
     for op in program.operations:
-        if op.kind == "x":
-            _pauli_x(state, op.targets[0], n)
-        elif op.kind == "h":
-            _hadamard(state, op.targets[0], n)
-        elif op.kind == "cx":
-            _controlled_x(state, op.targets[0], op.targets[1], n)
-        elif op.kind == "rx":
-            _rx(state, op.targets[0], n, op.params[0])
-        elif op.kind == "ry":
-            _ry(state, op.targets[0], n, op.params[0])
-        elif op.kind == "rz":
-            _rz(state, op.targets[0], n, op.params[0])
-        # "measure" operations affect only the sampled classical outcomes.
+        if op.kind == "measure":
+            # Measurements affect only the sampled classical outcomes.
+            continue
+        _apply_gate(state, op, n)
     return state
+
+
+def unitary_matrix(program: Program) -> list[list[complex]]:
+    """Return the full unitary U induced by the gates (pre-measurement).
+
+    The matrix acts on basis vectors with qubit ``i`` in bit ``i`` (q[0] is
+    the least significant bit), matching :func:`simulate_state_vector`.
+    Measurement operations are ignored. Columns are evolved independently by
+    applying each gate in source order, so for a circuit with gates G1..Gk the
+    result is U = Gk @ ... @ G1.
+    """
+    n = program.num_qubits
+    dim = 1 << n
+    gate_ops = [op for op in program.operations if op.kind != "measure"]
+
+    columns: list[list[complex]] = []
+    for start in range(dim):
+        state = [0j] * dim
+        state[start] = 1 + 0j
+        for op in gate_ops:
+            _apply_gate(state, op, n)
+        columns.append(state)
+
+    # Transpose columns-of-U into rows.
+    return [[columns[col][row] for col in range(dim)] for row in range(dim)]
 
 
 def sample_counts(program: Program, state: list[complex], shots: int, seed: int) -> dict[str, int]:

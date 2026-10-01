@@ -7,6 +7,12 @@ import json
 import sys
 
 from . import __version__
+from .equivalence import (
+    EQUIVALENCE_TOLERANCE,
+    MAX_EQUIVALENCE_QUBITS,
+    measurement_layout,
+    unitary_distance,
+)
 from .noise import (
     MAX_NOISE_QUBITS,
     NoiseModelError,
@@ -14,7 +20,7 @@ from .noise import (
     simulate_density_matrix,
 )
 from .openqasm import ParseError, ValidationError, parse
-from .simulator import sample_counts, sample_counts_from_probabilities, simulate_state_vector
+from .simulator import sample_counts, sample_counts_from_probabilities, simulate_state_vector, unitary_matrix
 
 
 def _positive_int(value: str) -> int:
@@ -27,8 +33,17 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _emit_error(error: str, message: str, line: int | None = None, column: int | None = None) -> None:
-    payload: dict[str, object] = {"error": error, "message": message}
+def _emit_error(
+    error: str,
+    message: str,
+    line: int | None = None,
+    column: int | None = None,
+    side: str | None = None,
+) -> None:
+    payload: dict[str, object] = {"error": error}
+    if side is not None:
+        payload["input"] = side
+    payload["message"] = message
     if line is not None:
         payload["line"] = line
         payload["column"] = column
@@ -124,6 +139,119 @@ def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | Non
     return 0
 
 
+def _load_comparison_program(side: str, source_arg: str):
+    """Read, parse and size-check one side of an equivalence comparison.
+
+    Returns the parsed :class:`Program`, or an exit code (1, 2 or 3) after
+    emitting the appropriate single-line error on stderr. *side* is ``"left"``
+    or ``"right"`` and is reported as ``input`` on every failure.
+    """
+    try:
+        if source_arg == "-":
+            data = sys.stdin.buffer.read()
+        else:
+            with open(source_arg, "rb") as handle:
+                data = handle.read()
+    except OSError as exc:
+        _emit_error(
+            "io_error",
+            f"cannot read source {source_arg!r}: {exc.strerror or exc}",
+            side=side,
+        )
+        return None, 1
+
+    try:
+        source = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _emit_error("io_error", f"source {source_arg!r} is not valid UTF-8: {exc}", side=side)
+        return None, 1
+
+    try:
+        program = parse(source)
+    except ParseError as exc:
+        _emit_error("parse_error", exc.message, exc.line, exc.column, side=side)
+        return None, 2
+    except ValidationError as exc:
+        _emit_error("validation_error", exc.message, exc.line, exc.column, side=side)
+        return None, 2
+
+    if program.num_qubits > MAX_EQUIVALENCE_QUBITS:
+        _emit_error(
+            "simulation_error",
+            f"equivalence comparison supports at most {MAX_EQUIVALENCE_QUBITS} qubits, "
+            f"{side} input has {program.num_qubits}",
+            side=side,
+        )
+        return None, 3
+
+    return program, None
+
+
+def _equivalent(left_arg: str, right_arg: str) -> int:
+    if left_arg == "-" and right_arg == "-":
+        # Standard input cannot serve both sides; do not read it.
+        _emit_error(
+            "comparison_error",
+            "left and right inputs cannot both be read from standard input",
+        )
+        return 2
+
+    # Fully validate each side (read, parse, semantics, size) in LEFT, RIGHT
+    # order, reporting only the first failure.
+    left, error_code = _load_comparison_program("left", left_arg)
+    if left is None:
+        return error_code
+    right, error_code = _load_comparison_program("right", right_arg)
+    if right is None:
+        return error_code
+
+    left_qubits = left.num_qubits
+    right_qubits = right.num_qubits
+
+    left_clbits, left_measurements = measurement_layout(left)
+    right_clbits, right_measurements = measurement_layout(right)
+
+    if left_qubits != right_qubits:
+        result: dict[str, object] = {
+            "schema_version": 1,
+            "equivalent": False,
+            "reason": "qubit_count_mismatch",
+            "left_num_qubits": left_qubits,
+            "right_num_qubits": right_qubits,
+            "distance": None,
+            "tolerance": EQUIVALENCE_TOLERANCE,
+        }
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0
+
+    distance = unitary_distance(unitary_matrix(left), unitary_matrix(right))
+
+    same_transform = distance <= EQUIVALENCE_TOLERANCE
+    same_layout = left_clbits == right_clbits and left_measurements == right_measurements
+
+    if not same_transform:
+        reason = "unitary_distance"
+        equivalent = False
+    elif not same_layout:
+        reason = "measurement_layout_mismatch"
+        equivalent = False
+    else:
+        reason = "equivalent"
+        equivalent = True
+
+    result = {
+        "schema_version": 1,
+        "equivalent": equivalent,
+        "reason": reason,
+        "left_num_qubits": left_qubits,
+        "right_num_qubits": right_qubits,
+        "distance": distance,
+        "tolerance": EQUIVALENCE_TOLERANCE,
+    }
+    sys.stdout.write(json.dumps(result) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="quantum-circuit-simulator",
@@ -143,6 +271,13 @@ def main(argv: list[str] | None = None) -> int:
         help="optional JSON noise model for density-matrix simulation ('-' reads stdin)",
     )
 
+    equivalent_parser = sub.add_parser(
+        "equivalent",
+        help="check whether two noiseless OpenQASM circuits implement the same transformation",
+    )
+    equivalent_parser.add_argument("left", help="path to the left OpenQASM source file, or '-' for stdin")
+    equivalent_parser.add_argument("right", help="path to the right OpenQASM source file, or '-' for stdin")
+
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -151,6 +286,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "simulate":
         return _simulate(args.source, args.shots, args.seed, args.noise_model)
+
+    if args.command == "equivalent":
+        return _equivalent(args.left, args.right)
 
     parser.print_help()
     return 0
