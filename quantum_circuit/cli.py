@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from . import __version__
@@ -36,13 +37,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _emit_error(
+def _error_payload(
     error: str,
     message: str,
     line: int | None = None,
     column: int | None = None,
     side: str | None = None,
-) -> None:
+) -> dict[str, object]:
     payload: dict[str, object] = {"error": error}
     if side is not None:
         payload["input"] = side
@@ -50,32 +51,71 @@ def _emit_error(
     if line is not None:
         payload["line"] = line
         payload["column"] = column
+    return payload
+
+
+def _emit_error(
+    error: str,
+    message: str,
+    line: int | None = None,
+    column: int | None = None,
+    side: str | None = None,
+) -> None:
+    _emit_error_payload(_error_payload(error, message, line, column, side))
+
+
+def _emit_error_payload(payload: dict[str, object]) -> None:
     sys.stderr.write(json.dumps(payload) + "\n")
 
 
-def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | None) -> int:
+def _run_simulation(
+    source_arg: str,
+    shots: int,
+    seed: int,
+    noise_model_arg: str | None,
+    base_dir: str | None = None,
+) -> tuple[dict[str, object] | None, dict[str, object] | None, int]:
+    """Run one simulation with the exact semantics of ``simulate``.
+
+    Returns ``(output, error, exit_code)``: on success *error* is ``None``
+    and *output* is the payload printed by ``simulate``; on failure *output*
+    is ``None`` and *error* is the payload ``simulate`` would write to
+    stderr (including line/column where applicable).
+
+    When *base_dir* is given (the batch case), relative paths are opened
+    relative to it while error messages keep quoting *source_arg* and
+    *noise_model_arg* verbatim, so messages match a standalone ``simulate``
+    invocation with the same path strings.
+    """
+
+    def open_path(path: str) -> str:
+        if base_dir is not None and not os.path.isabs(path):
+            return os.path.normpath(os.path.join(base_dir, path))
+        return path
+
     if noise_model_arg is not None and source_arg == "-" and noise_model_arg == "-":
-        _emit_error(
-            "noise_model_error",
-            "circuit source and noise model cannot both be read from standard input",
+        return (
+            None,
+            _error_payload(
+                "noise_model_error",
+                "circuit source and noise model cannot both be read from standard input",
+            ),
+            2,
         )
-        return 2
 
     try:
         if source_arg == "-":
             data = sys.stdin.buffer.read()
         else:
-            with open(source_arg, "rb") as handle:
+            with open(open_path(source_arg), "rb") as handle:
                 data = handle.read()
     except OSError as exc:
-        _emit_error("io_error", f"cannot read source {source_arg!r}: {exc.strerror or exc}")
-        return 1
+        return None, _error_payload("io_error", f"cannot read source {source_arg!r}: {exc.strerror or exc}"), 1
 
     try:
         source = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        _emit_error("io_error", f"source {source_arg!r} is not valid UTF-8: {exc}")
-        return 1
+        return None, _error_payload("io_error", f"source {source_arg!r} is not valid UTF-8: {exc}"), 1
 
     noise_model: dict[str, float] | None = None
     if noise_model_arg is not None:
@@ -83,30 +123,38 @@ def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | Non
             if noise_model_arg == "-":
                 raw_model = sys.stdin.buffer.read()
             else:
-                with open(noise_model_arg, "rb") as handle:
+                with open(open_path(noise_model_arg), "rb") as handle:
                     raw_model = handle.read()
         except OSError as exc:
-            _emit_error("io_error", f"cannot read noise model {noise_model_arg!r}: {exc.strerror or exc}")
-            return 1
+            return (
+                None,
+                _error_payload(
+                    "io_error", f"cannot read noise model {noise_model_arg!r}: {exc.strerror or exc}"
+                ),
+                1,
+            )
         try:
             model_text = raw_model.decode("utf-8")
         except UnicodeDecodeError as exc:
-            _emit_error("noise_model_error", f"noise model {noise_model_arg!r} is not valid UTF-8: {exc}")
-            return 2
+            return (
+                None,
+                _error_payload(
+                    "noise_model_error",
+                    f"noise model {noise_model_arg!r} is not valid UTF-8: {exc}",
+                ),
+                2,
+            )
         try:
             noise_model = parse_noise_model(model_text)
         except NoiseModelError as exc:
-            _emit_error("noise_model_error", str(exc))
-            return 2
+            return None, _error_payload("noise_model_error", str(exc)), 2
 
     try:
         program = parse(source)
     except ParseError as exc:
-        _emit_error("parse_error", exc.message, exc.line, exc.column)
-        return 2
+        return None, _error_payload("parse_error", exc.message, exc.line, exc.column), 2
     except ValidationError as exc:
-        _emit_error("validation_error", exc.message, exc.line, exc.column)
-        return 2
+        return None, _error_payload("validation_error", exc.message, exc.line, exc.column), 2
 
     if noise_model is None:
         state = simulate_state_vector(program)
@@ -121,12 +169,15 @@ def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | Non
         }
     else:
         if program.num_qubits > MAX_NOISE_QUBITS:
-            _emit_error(
-                "simulation_error",
-                f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
-                f"got {program.num_qubits}",
+            return (
+                None,
+                _error_payload(
+                    "simulation_error",
+                    f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
+                    f"got {program.num_qubits}",
+                ),
+                3,
             )
-            return 3
         probabilities = simulate_density_matrix(program, noise_model)
         counts = sample_counts_from_probabilities(program, probabilities, shots, seed)
         result = {
@@ -138,8 +189,186 @@ def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | Non
             "noise_model": noise_model,
             "counts": counts,
         }
+    return result, None, 0
+
+
+def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | None) -> int:
+    result, error, exit_code = _run_simulation(source_arg, shots, seed, noise_model_arg)
+    if error is not None:
+        _emit_error_payload(error)
+        return exit_code
     sys.stdout.write(json.dumps(result) + "\n")
     return 0
+
+
+# ------------------------------------------------------------- batch-simulate
+
+BATCH_SCHEMA_VERSION = 1
+MAX_BATCH_JOBS = 100
+_BATCH_ROOT_KEYS = ("schema_version", "jobs")
+_BATCH_JOB_KEYS = ("id", "source", "shots", "seed", "noise_model")
+
+
+class _BatchManifestError(Exception):
+    """The batch manifest is structurally invalid (``batch_input_error``)."""
+
+
+def _manifest_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _BatchManifestError(f"duplicate key {key!r} in batch manifest")
+        result[key] = value
+    return result
+
+
+def _reject_manifest_constant(value: str) -> None:
+    raise _BatchManifestError(f"batch manifest contains non-JSON constant {value!r}")
+
+
+def _is_json_int(value: object) -> bool:
+    # bool is a subclass of int but is not a JSON integer here.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_batch_manifest(data: object) -> list[dict[str, object]]:
+    """Validate the parsed manifest, returning the raw jobs in list order.
+
+    Every structural, type and range rule is checked here, before any task
+    file is read. Raises :class:`_BatchManifestError` on the first problem.
+    """
+    if not isinstance(data, dict):
+        raise _BatchManifestError("batch manifest must be a JSON object")
+
+    for key in data:
+        if key not in _BATCH_ROOT_KEYS:
+            raise _BatchManifestError(f"unknown batch manifest key {key!r}")
+
+    if "schema_version" not in data:
+        raise _BatchManifestError("batch manifest is missing required key 'schema_version'")
+    schema_version = data["schema_version"]
+    if not _is_json_int(schema_version) or schema_version != BATCH_SCHEMA_VERSION:
+        raise _BatchManifestError(
+            f"batch manifest schema_version must be {BATCH_SCHEMA_VERSION}, got {schema_version!r}"
+        )
+
+    if "jobs" not in data:
+        raise _BatchManifestError("batch manifest is missing required key 'jobs'")
+    jobs = data["jobs"]
+    if not isinstance(jobs, list):
+        raise _BatchManifestError("batch manifest 'jobs' must be an array")
+    if not 1 <= len(jobs) <= MAX_BATCH_JOBS:
+        raise _BatchManifestError(
+            f"batch manifest 'jobs' must contain between 1 and {MAX_BATCH_JOBS} jobs, got {len(jobs)}"
+        )
+
+    seen_ids: set[str] = set()
+    for index, job in enumerate(jobs):
+        where = f"job at jobs[{index}]"
+        if not isinstance(job, dict):
+            raise _BatchManifestError(f"{where} must be a JSON object")
+        for key in job:
+            if key not in _BATCH_JOB_KEYS:
+                raise _BatchManifestError(f"{where} has unknown key {key!r}")
+
+        if "id" not in job:
+            raise _BatchManifestError(f"{where} is missing required key 'id'")
+        job_id = job["id"]
+        if not isinstance(job_id, str) or not job_id:
+            raise _BatchManifestError(f"{where} 'id' must be a non-empty string")
+        if job_id in seen_ids:
+            raise _BatchManifestError(f"duplicate job id {job_id!r}")
+        seen_ids.add(job_id)
+
+        if "source" not in job:
+            raise _BatchManifestError(f"{where} is missing required key 'source'")
+        source = job["source"]
+        if not isinstance(source, str):
+            raise _BatchManifestError(f"{where} 'source' must be a string")
+        if source == "-":
+            raise _BatchManifestError(f"{where} 'source' must not be '-'; stdin is reserved for the manifest")
+
+        if "shots" in job:
+            shots = job["shots"]
+            if not _is_json_int(shots) or shots <= 0:
+                raise _BatchManifestError(f"{where} 'shots' must be a positive integer")
+
+        if "seed" in job and not _is_json_int(job["seed"]):
+            raise _BatchManifestError(f"{where} 'seed' must be an integer")
+
+        if "noise_model" in job:
+            noise_model = job["noise_model"]
+            if not isinstance(noise_model, str):
+                raise _BatchManifestError(f"{where} 'noise_model' must be a string path")
+            if noise_model == "-":
+                raise _BatchManifestError(
+                    f"{where} 'noise_model' must not be '-'; stdin is reserved for the manifest"
+                )
+
+    return jobs
+
+
+def _batch_simulate(manifest_arg: str) -> int:
+    try:
+        if manifest_arg == "-":
+            raw_manifest = sys.stdin.buffer.read()
+            base_dir = os.getcwd()
+        else:
+            with open(manifest_arg, "rb") as handle:
+                raw_manifest = handle.read()
+            base_dir = os.path.dirname(os.path.abspath(manifest_arg))
+    except OSError as exc:
+        _emit_error("io_error", f"cannot read manifest {manifest_arg!r}: {exc.strerror or exc}")
+        return 1
+
+    try:
+        manifest_text = raw_manifest.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _emit_error("io_error", f"manifest {manifest_arg!r} is not valid UTF-8: {exc}")
+        return 1
+
+    try:
+        data = json.loads(
+            manifest_text,
+            object_pairs_hook=_manifest_pairs,
+            parse_constant=_reject_manifest_constant,
+        )
+        jobs = _validate_batch_manifest(data)
+    except (json.JSONDecodeError, _BatchManifestError) as exc:
+        # Syntax problems are reported with the same shape as every other
+        # manifest rejection: a single batch_input_error line.
+        if isinstance(exc, json.JSONDecodeError):
+            message = f"batch manifest is not valid JSON: {exc}"
+        else:
+            message = str(exc)
+        _emit_error("batch_input_error", message)
+        return 2
+
+    results: list[dict[str, object]] = []
+    succeeded = 0
+    for job in jobs:
+        output, error, _exit_code = _run_simulation(
+            job["source"],
+            job.get("shots", 1024),
+            job.get("seed", 0),
+            job.get("noise_model"),
+            base_dir=base_dir,
+        )
+        if error is None:
+            succeeded += 1
+            results.append({"id": job["id"], "status": "succeeded", "output": output})
+        else:
+            results.append({"id": job["id"], "status": "failed", "error": error})
+
+    summary: dict[str, object] = {
+        "schema_version": BATCH_SCHEMA_VERSION,
+        "job_count": len(jobs),
+        "succeeded": succeeded,
+        "failed": len(jobs) - succeeded,
+        "results": results,
+    }
+    sys.stdout.write(json.dumps(summary) + "\n")
+    return 0 if succeeded == len(jobs) else 3
 
 
 def _read_source(source_arg: str) -> str | None:
@@ -431,6 +660,15 @@ def main(argv: list[str] | None = None) -> int:
     metrics_parser.add_argument("left", help="path to the left OpenQASM source file, or '-' for stdin")
     metrics_parser.add_argument("right", help="path to the right OpenQASM source file, or '-' for stdin")
 
+    batch_parser = sub.add_parser(
+        "batch-simulate",
+        help="run a manifest of independent simulations in list order",
+    )
+    batch_parser.add_argument(
+        "manifest",
+        help="path to the UTF-8 JSON batch manifest, or '-' for stdin",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -439,6 +677,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "simulate":
         return _simulate(args.source, args.shots, args.seed, args.noise_model)
+
+    if args.command == "batch-simulate":
+        return _batch_simulate(args.manifest)
 
     if args.command == "equivalent":
         return _equivalent(args.left, args.right)

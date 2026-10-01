@@ -322,3 +322,413 @@ def test_process_parameterized_gate_from_stdin():
     assert result.returncode == 0
     assert result.stdout.count("\n") == 1
     assert json.loads(result.stdout)["counts"] == {"1": 16}
+
+
+# -------------------------------------------------------------- batch-simulate
+
+
+BELL = (
+    "qreg q[2];\ncreg c[2];\nh q[0];\ncx q[0],q[1];\n"
+    "measure q[0] -> c[0];\nmeasure q[1] -> c[1];\n"
+)
+X_CIRCUIT = "qreg q[1];\ncreg c[1];\nx q[0];\nmeasure q[0] -> c[0];\n"
+
+
+@pytest.fixture
+def batch_env(tmp_path):
+    def _qasm(body: str = X_CIRCUIT, name: str = "a.qasm") -> str:
+        path = tmp_path / name
+        path.write_text(HEADER + body, encoding="utf-8")
+        return str(path)
+
+    def _model(payload: object, name: str = "model.json") -> str:
+        path = tmp_path / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def _manifest(payload: object, name: str = "jobs.json") -> str:
+        path = tmp_path / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    return tmp_path, _qasm, _model, _manifest
+
+
+def test_batch_success_mixed_noise_and_order(batch_env, capsys):
+    tmp_path, qasm, model, manifest = batch_env
+    a = qasm(X_CIRCUIT, "a.qasm")
+    bell = qasm(BELL, "bell.qasm")
+    noise = model({"bit_flip": 0.5})
+    path = manifest(
+        {
+            "schema_version": 1,
+            "jobs": [
+                {"id": "a", "source": "a.qasm", "shots": 16, "seed": 3},
+                {"id": "bell", "source": "bell.qasm"},
+                {"id": "noisy", "source": "a.qasm", "noise_model": "model.json", "shots": 8, "seed": 1},
+            ],
+        }
+    )
+    assert cli.main(["batch-simulate", path]) == 0
+    raw = capsys.readouterr().out
+    assert raw.count("\n") == 1
+    data = json.loads(raw)
+    assert list(data) == ["schema_version", "job_count", "succeeded", "failed", "results"]
+    assert (data["schema_version"], data["job_count"]) == (1, 3)
+    assert (data["succeeded"], data["failed"]) == (3, 0)
+
+    results = data["results"]
+    assert [r["id"] for r in results] == ["a", "bell", "noisy"]
+    assert all(list(r) == ["id", "status", "output"] for r in results)
+    assert all(r["status"] == "succeeded" for r in results)
+
+    assert results[0]["output"] == {
+        "schema_version": 1,
+        "shots": 16,
+        "seed": 3,
+        "num_qubits": 1,
+        "num_clbits": 1,
+        "counts": {"1": 16},
+    }
+    assert results[1]["output"]["shots"] == 1024  # default
+    assert results[1]["output"]["seed"] == 0
+    noisy_output = results[2]["output"]
+    assert noisy_output["schema_version"] == 2
+    assert noisy_output["noise_model"] == {"bit_flip": 0.5}
+    assert sum(noisy_output["counts"].values()) == 8
+
+
+def test_batch_output_matches_standalone_simulate(batch_env, capsys):
+    tmp_path, qasm, model, manifest = batch_env
+    qasm(BELL, "bell.qasm")
+    model({"depolarizing": 0.25}, "noise.json")
+    jobs = [
+        {"id": "clean", "source": "bell.qasm", "shots": 77, "seed": -12},
+        {"id": "noisy", "source": "bell.qasm", "shots": 33, "seed": 9, "noise_model": "noise.json"},
+    ]
+    path = manifest({"schema_version": 1, "jobs": jobs})
+
+    standalone = {}
+    for job in jobs:
+        assert cli.main(
+            [
+                "simulate",
+                str(tmp_path / job["source"]),
+                "--shots",
+                str(job["shots"]),
+                "--seed",
+                str(job["seed"]),
+                *(["--noise-model", str(tmp_path / job["noise_model"])] if "noise_model" in job else []),
+            ]
+        ) == 0
+        standalone[job["id"]] = json.loads(capsys.readouterr().out)
+
+    assert cli.main(["batch-simulate", path]) == 0
+    results = json.loads(capsys.readouterr().out)["results"]
+    for result in results:
+        assert result["output"] == standalone[result["id"]]
+
+
+def test_batch_job_failure_is_embedded_and_continues(batch_env, capsys):
+    tmp_path, qasm, model, manifest = batch_env
+    bad_parse = tmp_path / "bad.qasm"
+    bad_parse.write_text(HEADER + "qreg q[1];\ncreg c[1];\nx q[0]\n", encoding="utf-8")
+    model({"bit_flip": 2}, "badmodel.json")
+    qasm(X_CIRCUIT, "ok.qasm")
+    path = manifest(
+        {
+            "schema_version": 1,
+            "jobs": [
+                {"id": "parse", "source": "bad.qasm"},
+                {"id": "missing", "source": "nope.qasm"},
+                {"id": "badnoise", "source": "ok.qasm", "noise_model": "badmodel.json"},
+                {"id": "ok", "source": "ok.qasm", "shots": 4, "seed": 1},
+            ],
+        }
+    )
+    rc = cli.main(["batch-simulate", path])
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert captured.err == ""
+    data = json.loads(captured.out)
+    assert (data["succeeded"], data["failed"]) == (1, 3)
+    results = data["results"]
+    assert all(list(r) == ["id", "status", "error"] for r in results[:3])
+    assert results[0]["error"]["error"] == "parse_error"
+    assert results[0]["error"]["line"] >= 1 and results[0]["error"]["column"] >= 1
+    assert results[1]["error"]["error"] == "io_error"
+    assert results[2]["error"]["error"] == "noise_model_error"
+    assert results[3]["status"] == "succeeded"
+    assert results[3]["output"]["counts"] == {"1": 4}
+
+
+def test_batch_relative_paths_resolve_from_manifest_directory(batch_env, capsys, monkeypatch):
+    tmp_path, qasm, model, _manifest = batch_env
+    sub = tmp_path / "nested"
+    sub.mkdir()
+    qasm(X_CIRCUIT, "nested/c.qasm")
+    model({"phase_damping": 0.1}, "nested/m.json")
+    manifest_path = sub / "jobs.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "jobs": [{"id": "j", "source": "c.qasm", "shots": 3, "noise_model": "m.json"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Run from another cwd; the manifest directory must anchor the paths.
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["batch-simulate", str(manifest_path)]) == 0
+    result = json.loads(capsys.readouterr().out)["results"][0]
+    assert result["status"] == "succeeded"
+    assert result["output"]["schema_version"] == 2
+
+
+def test_batch_stdin_manifest_uses_cwd(batch_env, capsys, monkeypatch):
+    import io
+
+    tmp_path, qasm, model, _manifest = batch_env
+    qasm(X_CIRCUIT, "cwd.qasm")
+    monkeypatch.chdir(tmp_path)
+    payload = json.dumps({"schema_version": 1, "jobs": [{"id": "j", "source": "cwd.qasm", "shots": 2}]})
+    monkeypatch.setattr(cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(payload.encode())))
+    assert cli.main(["batch-simulate", "-"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["results"][0]["status"] == "succeeded"
+
+
+def test_batch_byte_identical_and_independent_of_other_jobs(batch_env, capsys):
+    tmp_path, qasm, model, manifest = batch_env
+    qasm(BELL, "bell.qasm")
+    manifest_one = manifest(
+        {"schema_version": 1, "jobs": [{"id": "B", "source": "bell.qasm", "shots": 30, "seed": 7}]},
+        "one.json",
+    )
+    manifest_many = manifest(
+        {
+            "schema_version": 1,
+            "jobs": [
+                {"id": "X", "source": "bell.qasm", "shots": 999, "seed": 12345},
+                {"id": "B", "source": "bell.qasm", "shots": 30, "seed": 7},
+                {"id": "Y", "source": "bell.qasm"},
+            ],
+        },
+        "many.json",
+    )
+
+    outputs = set()
+    for _ in range(2):
+        assert cli.main(["batch-simulate", manifest_one]) == 0
+        outputs.add(capsys.readouterr().out)
+    assert len(outputs) == 1
+
+    assert cli.main(["batch-simulate", manifest_one]) == 0
+    one_output = json.loads(capsys.readouterr().out)["results"][0]["output"]
+    assert cli.main(["batch-simulate", manifest_many]) == 0
+    many = json.loads(capsys.readouterr().out)["results"]
+    b_output = next(result["output"] for result in many if result["id"] == "B")
+    assert b_output == one_output
+
+
+def test_batch_noisy_too_many_qubits_is_simulation_error(batch_env, capsys):
+    tmp_path, qasm, model, manifest = batch_env
+    body = (
+        "qreg q[11];\ncreg c[11];\n"
+        + "".join(f"measure q[{i}] -> c[{i}];\n" for i in range(11))
+    )
+    qasm(body, "big.qasm")
+    model({"bit_flip": 0.1}, "m.json")
+    path = manifest(
+        {"schema_version": 1, "jobs": [{"id": "big", "source": "big.qasm", "noise_model": "m.json"}]}
+    )
+    assert cli.main(["batch-simulate", path]) == 3
+    result = json.loads(capsys.readouterr().out)["results"][0]
+    assert result["status"] == "failed"
+    assert result["error"]["error"] == "simulation_error"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schema_version": 1},  # missing jobs
+        {"jobs": []},  # missing schema_version
+        {"schema_version": 0, "jobs": []},
+        {"schema_version": "1", "jobs": []},
+        {"schema_version": 1, "jobs": {}},
+        {"schema_version": 1, "jobs": []},  # too few
+        {"schema_version": 1, "jobs": [], "extra": 1},  # unknown root key
+        [1, 2],  # root not object
+    ],
+)
+def test_batch_invalid_manifest_structure(batch_env, capsys, payload):
+    tmp_path, _qasm, _model, manifest = batch_env
+    path = manifest(payload)
+    rc = cli.main(["batch-simulate", path])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"] == "batch_input_error"
+    assert captured.err.count("\n") == 1
+
+
+def test_batch_too_many_jobs(batch_env, capsys):
+    tmp_path, _qasm, _model, manifest = batch_env
+    jobs = [{"id": str(i), "source": "a.qasm"} for i in range(101)]
+    rc = cli.main(["batch-simulate", manifest({"schema_version": 1, "jobs": jobs})])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"] == "batch_input_error"
+
+
+@pytest.mark.parametrize(
+    "job",
+    [
+        {"source": "a.qasm"},  # missing id
+        {"id": "", "source": "a.qasm"},  # empty id
+        {"id": 1, "source": "a.qasm"},  # id not string
+        {"id": "a"},  # missing source
+        {"id": "a", "source": 3},  # source not string
+        {"id": "a", "source": "-"},  # stdin reserved
+        {"id": "a", "source": "a.qasm", "shots": 0},
+        {"id": "a", "source": "a.qasm", "shots": -2},
+        {"id": "a", "source": "a.qasm", "shots": 1.5},
+        {"id": "a", "source": "a.qasm", "shots": True},
+        {"id": "a", "source": "a.qasm", "seed": "x"},
+        {"id": "a", "source": "a.qasm", "seed": 1.0},
+        {"id": "a", "source": "a.qasm", "noise_model": 4},
+        {"id": "a", "source": "a.qasm", "noise_model": "-"},
+        {"id": "a", "source": "a.qasm", "bogus": 1},
+    ],
+)
+def test_batch_invalid_job_fields(batch_env, capsys, job):
+    tmp_path, _qasm, _model, manifest = batch_env
+    path = manifest({"schema_version": 1, "jobs": [job]})
+    rc = cli.main(["batch-simulate", path])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"] == "batch_input_error"
+
+
+def test_batch_duplicate_id_rejected(batch_env, capsys):
+    tmp_path, _qasm, _model, manifest = batch_env
+    path = manifest(
+        {
+            "schema_version": 1,
+            "jobs": [
+                {"id": "same", "source": "a.qasm"},
+                {"id": "other", "source": "a.qasm"},
+                {"id": "same", "source": "a.qasm"},
+            ],
+        }
+    )
+    rc = cli.main(["batch-simulate", path])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "same" in json.loads(captured.err)["message"]
+
+
+def test_batch_duplicate_json_key_rejected(batch_env, capsys):
+    tmp_path, _qasm, _model, _manifest = batch_env
+    path = tmp_path / "dup.json"
+    path.write_text(
+        '{"schema_version": 1, "schema_version": 1, "jobs": '
+        '[{"id": "a", "source": "a.qasm"}]}',
+        encoding="utf-8",
+    )
+    rc = cli.main(["batch-simulate", str(path)])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert json.loads(captured.err)["error"] == "batch_input_error"
+
+
+def test_batch_duplicate_job_json_key_rejected(batch_env, capsys):
+    tmp_path, _qasm, _model, _manifest = batch_env
+    path = tmp_path / "dupjob.json"
+    path.write_text(
+        '{"schema_version": 1, "jobs": [{"id": "a", "id": "b", "source": "a.qasm"}]}',
+        encoding="utf-8",
+    )
+    rc = cli.main(["batch-simulate", str(path)])
+    assert rc == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "batch_input_error"
+
+
+def test_batch_syntax_error_is_batch_input_error(batch_env, capsys):
+    tmp_path, _qasm, _model, _manifest = batch_env
+    path = tmp_path / "broken.json"
+    path.write_text('{"schema_version": 1, "jobs": [', encoding="utf-8")
+    rc = cli.main(["batch-simulate", str(path)])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"] == "batch_input_error"
+
+
+def test_batch_json_constants_rejected(batch_env, capsys):
+    tmp_path, _qasm, _model, _manifest = batch_env
+    path = tmp_path / "const.json"
+    path.write_text('{"schema_version": 1, "jobs": [{"id": "a", "shots": NaN}]}', encoding="utf-8")
+    # The source is also missing; the structural check happens before reads.
+    rc = cli.main(["batch-simulate", str(path)])
+    assert rc == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "batch_input_error"
+
+
+def test_batch_validates_before_reading_any_task_file(batch_env, capsys):
+    tmp_path, _qasm, _model, manifest = batch_env
+    # Neither referenced file exists; an invalid manifest must still report
+    # batch_input_error rather than an embedded io_error.
+    path = manifest(
+        {"schema_version": 1, "jobs": [{"id": "a", "source": "missing1.qasm"}, {"id": "a", "source": "x"}]}
+    )
+    rc = cli.main(["batch-simulate", path])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert json.loads(captured.err)["error"] == "batch_input_error"
+
+
+def test_batch_missing_manifest_is_io_error(capsys):
+    rc = cli.main(["batch-simulate", "/nonexistent/manifest.json"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"] == "io_error"
+
+
+def test_batch_invalid_utf8_manifest_is_io_error(tmp_path, capsys):
+    path = tmp_path / "utf8.json"
+    path.write_bytes(b'{"schema_version": 1, "jobs": []}\xff')
+    rc = cli.main(["batch-simulate", str(path)])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"] == "io_error"
+
+
+def test_process_batch_end_to_end(tmp_path):
+    circuit = tmp_path / "c.qasm"
+    circuit.write_text(HEADER + X_CIRCUIT, encoding="utf-8")
+    manifest = tmp_path / "jobs.json"
+    manifest.write_text(
+        json.dumps({"schema_version": 1, "jobs": [{"id": "j", "source": "c.qasm", "shots": 6}]}),
+        encoding="utf-8",
+    )
+    result = _run_process("batch-simulate", str(manifest))
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert result.stdout.count("\n") == 1
+    data = json.loads(result.stdout)
+    assert data["results"][0]["output"]["counts"] == {"1": 6}
+
+
+def test_process_batch_input_error_exit_code(tmp_path):
+    manifest = tmp_path / "jobs.json"
+    manifest.write_text('{"schema_version": 1, "jobs": []}', encoding="utf-8")
+    result = _run_process("batch-simulate", str(manifest))
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["error"] == "batch_input_error"
