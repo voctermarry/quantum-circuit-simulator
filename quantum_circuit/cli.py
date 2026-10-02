@@ -27,13 +27,8 @@ from .noise import (
 )
 from .openqasm import ParseError, Program, ValidationError, parse
 from .optimizer import optimize as optimize_program
-from .simulator import (
-    measurement_probabilities,
-    sample_counts,
-    sample_counts_from_probabilities,
-    simulate_state_vector,
-    unitary_matrix,
-)
+from .results import probability_payload, simulation_payload
+from .simulator import simulate_state_vector, unitary_matrix
 
 
 def _positive_int(value: str) -> int:
@@ -357,15 +352,7 @@ def _compute_simulation(
     """
     if noise_model is None:
         state = simulate_state_vector(program)
-        counts = sample_counts(program, state, shots, seed)
-        result: dict[str, object] = {
-            "schema_version": 1,
-            "shots": shots,
-            "seed": seed,
-            "num_qubits": program.num_qubits,
-            "num_clbits": program.num_clbits,
-            "counts": counts,
-        }
+        basis_probabilities = [abs(amplitude) ** 2 for amplitude in state]
     else:
         if program.num_qubits > MAX_NOISE_QUBITS:
             return (
@@ -377,17 +364,8 @@ def _compute_simulation(
                 ),
                 3,
             )
-        probabilities = simulate_density_matrix(program, noise_model)
-        counts = sample_counts_from_probabilities(program, probabilities, shots, seed)
-        result = {
-            "schema_version": 2,
-            "shots": shots,
-            "seed": seed,
-            "num_qubits": program.num_qubits,
-            "num_clbits": program.num_clbits,
-            "noise_model": noise_model,
-            "counts": counts,
-        }
+        basis_probabilities = simulate_density_matrix(program, noise_model)
+    result = simulation_payload(program, basis_probabilities, shots, seed, noise_model)
     return result, None, 0
 
 
@@ -416,64 +394,6 @@ def _simulate(
 
 
 # --------------------------------------------------------------- probabilities
-
-# Probabilities are reported in full; entries this close to 0 are omitted
-# and entries this close to 1 are reported as exactly 1. Reported values
-# sum to within 1e-12 of 1.
-_PROBABILITY_ZERO_TOLERANCE = 1e-15
-_PROBABILITY_ONE_TOLERANCE = 1e-15
-
-
-def _snap_probability(value: float) -> float | None:
-    """Snap one probability for deterministic output.
-
-    Returns ``None`` when the entry is omitted (magnitude at most
-    ``1e-15``), ``1.0`` when it is within ``1e-15`` of 1, and otherwise a
-    finite ``float`` clamped to ``(0, 1)`` so simulation round-off can
-    never produce an out-of-range value.
-    """
-    if abs(value) <= _PROBABILITY_ZERO_TOLERANCE:
-        return None
-    if abs(1.0 - value) <= _PROBABILITY_ONE_TOLERANCE:
-        return 1.0
-    return min(1.0, max(0.0, float(value)))
-
-
-def _probability_payload(
-    program: Program,
-    basis_probabilities: list[float],
-    noise_model: dict[str, float] | None,
-) -> dict[str, object]:
-    """Build the deterministic ``probabilities`` success payload.
-
-    The aggregated classical distribution is renormalized by its total
-    first, mirroring the normalization the sampling path applies to basis
-    probabilities, so simulation round-off (notably density-matrix drift)
-    cannot move the reported sum away from 1.
-    """
-    aggregated = measurement_probabilities(program, basis_probabilities)
-    total = math.fsum(aggregated.values())
-    probabilities: dict[str, float] = {}
-    for key, value in aggregated.items():
-        normalized = value / total if total else value
-        snapped = _snap_probability(normalized)
-        if snapped is not None:
-            probabilities[key] = snapped
-
-    if noise_model is None:
-        return {
-            "schema_version": 1,
-            "num_qubits": program.num_qubits,
-            "num_clbits": program.num_clbits,
-            "probabilities": probabilities,
-        }
-    return {
-        "schema_version": 2,
-        "num_qubits": program.num_qubits,
-        "num_clbits": program.num_clbits,
-        "noise_model": noise_model,
-        "probabilities": probabilities,
-    }
 
 
 def _probabilities(
@@ -504,7 +424,7 @@ def _probabilities(
             return 3
         basis_probabilities = simulate_density_matrix(program, noise_model)
 
-    result = _probability_payload(program, basis_probabilities, noise_model)
+    result = probability_payload(program, basis_probabilities, noise_model)
     return _finish(ctx, result, 0)
 
 

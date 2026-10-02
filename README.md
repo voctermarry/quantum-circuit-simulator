@@ -320,10 +320,38 @@ measure q[i] -> c[k];
 | `--output PATH` 父目录不存在、PATH 为 `-` 或目录、权限不足、写入或替换失败（stdout 为空；已有目标内容不变，不留半成品文件） | 1 | `output_error` |
 | `--output PATH` 与本次读取的任一非标准输入文件（线路、噪声模型、批量清单、对账基线或清单引用文件）绝对规范化后相同（不运行仿真或重跑任务，不修改文件） | 2 | `output_error` |
 
+## Python 线路 DSL
+
+除命令行外，可直接用 `quantum_circuit.Circuit` 构造与门集等价的线路，并在 Python 内获得与命令行 JSON 完全一致的结果：
+
+```python
+from quantum_circuit import Circuit, ParseError, ValidationError, NoiseModelError
+
+circuit = (
+    Circuit(2, 2)            # 量子位数、经典位数，均为 1 至 20 的非布尔整数
+    .h(0).cx(0, 1)
+    .measure(0, 0).measure(1, 1)
+)
+
+text = circuit.to_qasm()                 # 固定 q、c 寄存器名，末尾换行
+same = Circuit.from_qasm(text)           # 等价地，也可从 OpenQASM 文本创建
+circuit.sample()                         # 等同 simulate 输出对象
+circuit.probabilities()                  # 等同 probabilities 输出对象
+circuit.sample(noise_model={"bit_flip": 0.1})
+```
+
+- 链式方法：`x`、`h`、`cx`、`cz`、`rx`、`ry`、`rz`、`crx`、`cry`、`crz` 与逐位 `measure(qubit, clbit)`；操作保持加入顺序，每个方法返回同一线路对象。
+- 下标必须是非布尔整数且位于对应寄存器范围内；受控门控制位与目标位不得相同；角度只接受有限的整数或浮点数，序列化使用可还原为同一浮点值的最短十进制（负零写为 `0`）。
+- 每个量子位、经典位最多参与一次测量；测量开始后不能再添加量子门。类型不符抛 `TypeError`，越界、非有限角度及上述语义冲突抛 `ValueError`；失败的追加不改变已有线路。
+- `Circuit.from_qasm` 沿用现有解析与校验，继续抛 `ParseError` 或 `ValidationError`，并保留其 `line`、`column`。
+- `sample(shots=1024, seed=0, noise_model=None)` 返回的字典字段与取值与对同一线路执行 `simulate` 的 JSON 对象逐项一致（默认 shots/seed、测量位序、无测量结果、噪声通道顺序、量子位上限、确定性）；`probabilities(noise_model=None)` 同理对应 `probabilities` 命令。
+- `noise_model` 直接接收映射，沿用四类通道（`amplitude_damping`、`phase_damping`、`bit_flip`、`depolarizing`）及 0 到 1 的概率校验，非法模型抛 `NoiseModelError`；带噪声线路超过 10 个量子位抛 `ValueError`。
+- `shots` 非正抛 `ValueError`、类型错误抛 `TypeError`；`seed` 必须为整数（可为负），否则抛 `TypeError`。每次采样使用由 `seed` 初始化的独立随机状态，仿真不修改线路，相同参数重复调用结果相等，且一条线路的多次调用不共享随机状态。
+
 ## 现有公开接口
 
 - 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`probabilities`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
-- Python 包 `quantum_circuit`，其 `__version__` 为当前版本号
+- Python 包 `quantum_circuit`：`__version__` 为当前版本号；`Circuit` 为线路 DSL；`ParseError`、`ValidationError`、`NoiseModelError` 为对应错误类型
 
 ## 限制
 

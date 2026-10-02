@@ -52,6 +52,36 @@ def _object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def validate_noise_model(data: object) -> dict[str, float]:
+    """Validate an in-memory noise-model mapping.
+
+    Shared by JSON text parsing (:func:`parse_noise_model`) and the Python
+    circuit DSL, which receives a mapping directly. The model must be a
+    non-empty mapping naming at least one channel from
+    :data:`CHANNEL_ORDER` with a finite ``int``/``float`` probability in
+    ``[0, 1]`` (booleans are not numbers). Returns the channels in fixed
+    :data:`CHANNEL_ORDER` order as floats. Raises
+    :class:`NoiseModelError` on any invalid content.
+    """
+    if not isinstance(data, dict):
+        raise NoiseModelError("noise model must be an object")
+    if not data:
+        raise NoiseModelError("noise model must configure at least one channel")
+    for key, value in data.items():
+        if not isinstance(key, str):
+            raise NoiseModelError("noise channel names must be strings")
+        if key not in CHANNEL_ORDER:
+            raise NoiseModelError(f"unknown noise channel {key!r}")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise NoiseModelError(f"noise channel {key!r} probability must be a number")
+        probability = float(value)
+        if not math.isfinite(probability):
+            raise NoiseModelError(f"noise channel {key!r} probability must be finite")
+        if not 0.0 <= probability <= 1.0:
+            raise NoiseModelError(f"noise channel {key!r} probability must be between 0 and 1")
+    return {channel: float(data[channel]) for channel in CHANNEL_ORDER if channel in data}
+
+
 def parse_noise_model(text: str) -> dict[str, float]:
     """Parse and validate noise-model JSON text.
 
@@ -64,21 +94,7 @@ def parse_noise_model(text: str) -> dict[str, float]:
         data = json.loads(text, object_pairs_hook=_object_pairs, parse_constant=_reject_constant)
     except json.JSONDecodeError as exc:
         raise NoiseModelError(f"noise model is not valid JSON: {exc}") from None
-    if not isinstance(data, dict):
-        raise NoiseModelError("noise model must be a JSON object")
-    if not data:
-        raise NoiseModelError("noise model must configure at least one channel")
-    for key, value in data.items():
-        if key not in CHANNEL_ORDER:
-            raise NoiseModelError(f"unknown noise channel {key!r}")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise NoiseModelError(f"noise channel {key!r} probability must be a JSON number")
-        probability = float(value)
-        if not math.isfinite(probability):
-            raise NoiseModelError(f"noise channel {key!r} probability must be finite")
-        if not 0.0 <= probability <= 1.0:
-            raise NoiseModelError(f"noise channel {key!r} probability must be between 0 and 1")
-    return {channel: float(data[channel]) for channel in CHANNEL_ORDER if channel in data}
+    return validate_noise_model(data)
 
 
 def _basis_offsets(size: int, bit: int):
