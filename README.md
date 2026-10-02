@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、按清单批量执行独立仿真的 `batch-simulate` 入口、按清单重跑并与历史批量结果对账的 `reconcile` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、输出末态精确测量概率的 `probabilities` 入口、按清单批量执行独立仿真的 `batch-simulate` 入口、按清单重跑并与历史批量结果对账的 `reconcile` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
 
 ## 环境与安装
 
@@ -26,6 +26,7 @@ python -m pytest
 quantum-circuit-simulator version                # 打印版本号
 quantum-circuit-simulator --help                 # 打印用法
 quantum-circuit-simulator simulate circuit.qasm  # 仿真并采样
+quantum-circuit-simulator probabilities circuit.qasm  # 输出末态精确测量概率
 quantum-circuit-simulator batch-simulate jobs.json  # 按清单批量仿真
 quantum-circuit-simulator reconcile jobs.json baseline.json  # 重跑清单并与历史结果对账
 quantum-circuit-simulator equivalent a.qasm b.qasm  # 判断两份线路是否同一变换
@@ -65,6 +66,20 @@ quantum-circuit-simulator simulate SOURCE [--shots N] [--seed S] [--noise-model 
 每个量子门完成后，对该门涉及的量子位施加配置的通道；`cx` 的两位按下标升序处理，同一位固定按 `amplitude_damping`、`phase_damping`、`bit_flip`、`depolarizing` 的顺序处理。采样取最终密度矩阵的对角概率，噪声演化不消耗 seed。
 
 成功输出字段顺序为 `schema_version`、`shots`、`seed`、`num_qubits`、`num_clbits`、`noise_model`、`counts`，其中 `schema_version` 为 2；`noise_model` 按固定通道顺序仅回显已给概率，模型的空白与键顺序不影响输出。
+
+### probabilities 子命令
+
+```bash
+quantum-circuit-simulator probabilities SOURCE [--noise-model PATH]
+```
+
+输出末态的精确测量概率，不采样。`SOURCE` 与 `--noise-model` 的文件、UTF-8、标准输入与相对路径语义沿用 `simulate`；两者不能同时为 `-`（此时不读取标准输入）。入口不接受 `--shots` 或 `--seed`。无噪声时沿用状态向量语义（最多 20 个量子位），带噪声时沿用既有通道顺序与密度矩阵语义（最多 10 个量子位）。
+
+成功时 stdout 输出单行确定性 JSON，相同输入的字节一致。无噪声时字段顺序为 `schema_version`、`num_qubits`、`num_clbits`、`probabilities`，`schema_version` 为 1；带噪声时 `schema_version` 为 2，并在 `num_clbits` 之后按固定通道顺序回显 `noise_model`。
+
+`probabilities` 的键沿用 `simulate` counts 的经典位定宽顺序（最高经典位下标在前），按字典序排列；基矢概率按测量映射聚合，未写入的经典位为 0，无测量时仅输出概率为 1 的全零串。绝对值不超过 1e-15 的项省略，与 1 的差不超过 1e-15 的项写为整数 1，其余为 0 到 1 的有限 JSON 数字；所有项之和与 1 的误差不超过 1e-12。
+
+错误名称、位置字段与退出码沿用 `simulate`：源文件不可读或非法 UTF-8、噪声文件不可读为 `io_error`（退出码 1）；词法/语法错误为 `parse_error`、语义错误为 `validation_error`（均带位置，退出码 2）；噪声模型内容不合规或线路与模型同时取 `-` 为 `noise_model_error`（退出码 2）；带噪声线路超过 10 个量子位为 `simulation_error`（退出码 3）。失败时 stdout 为空。
 
 ### batch-simulate 子命令
 
@@ -273,10 +288,10 @@ measure q[i] -> c[k];
 
 ## 现有公开接口
 
-- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
+- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`probabilities`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
 - Python 包 `quantum_circuit`，其 `__version__` 为当前版本号
 
 ## 限制
 
 - 仅支持 OpenQASM 2.0 的上述子集：`x`、`h`、`cx` 与参数化门 `rx`、`ry`、`rz`，以及按位测量，不支持条件执行或多寄存器。
-- 状态向量随量子位数指数增长，寄存器大小上限为 20；密度矩阵噪声仿真上限为 10 个量子位；`equivalent` 稠密酉矩阵比较上限为 8 个量子位；`state-metrics` 基于状态向量，沿用 20 个量子位的寄存器上限。
+- 状态向量随量子位数指数增长，寄存器大小上限为 20；密度矩阵噪声仿真上限为 10 个量子位（`probabilities` 沿用相同上限）；`equivalent` 稠密酉矩阵比较上限为 8 个量子位；`state-metrics` 基于状态向量，沿用 20 个量子位的寄存器上限。

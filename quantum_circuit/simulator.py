@@ -10,6 +10,10 @@ from .openqasm import Operation, Program
 
 _SQRT1_2 = 2.0**-0.5
 
+# Exact-probability output drops entries within this tolerance of 0 and
+# reports entries within it of 1 as exactly 1.
+PROBABILITY_TOLERANCE = 1e-15
+
 
 def _hadamard(state: list[complex], qubit: int, num_qubits: int) -> None:
     bit = 1 << qubit
@@ -195,3 +199,46 @@ def sample_counts_from_probabilities(
         counts[key] = counts.get(key, 0) + 1
 
     return dict(sorted(counts.items()))
+
+
+def exact_measurement_probabilities(
+    program: Program, probabilities: list[float]
+) -> dict[str, object]:
+    """Aggregate basis-state probabilities into exact classical outcomes.
+
+    Keys are fixed-width classical bit strings (highest clbit index first),
+    matching :func:`sample_counts_from_probabilities`, and are sorted
+    lexicographically; classical bits never written by a measurement stay 0.
+    Entries whose magnitude is at most :data:`PROBABILITY_TOLERANCE` are
+    omitted and entries within the same tolerance of 1 are reported as the
+    integer 1; every other value is a finite float in (0, 1). When the
+    circuit has no measurements the only entry is the all-zero string with
+    probability 1.
+    """
+    measurements = [(op.targets[0], op.targets[1]) for op in program.operations if op.kind == "measure"]
+    width = program.num_clbits
+    zero_key = format(0, f"0{width}b") if width else ""
+    if not measurements:
+        return {zero_key: 1}
+
+    aggregated: dict[str, float] = {}
+    for basis, probability in enumerate(probabilities):
+        if probability == 0.0:
+            continue
+        classical = 0
+        for qubit, clbit in measurements:
+            if (basis >> qubit) & 1:
+                classical |= 1 << clbit
+        key = format(classical, f"0{width}b") if width else ""
+        aggregated[key] = aggregated.get(key, 0.0) + probability
+
+    result: dict[str, object] = {}
+    for key in sorted(aggregated):
+        value = aggregated[key]
+        if abs(value) <= PROBABILITY_TOLERANCE:
+            continue
+        if abs(value - 1.0) <= PROBABILITY_TOLERANCE:
+            result[key] = 1
+        else:
+            result[key] = value
+    return result
