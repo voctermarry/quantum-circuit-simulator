@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 
 from . import __version__
 from .equivalence import (
@@ -75,6 +76,129 @@ def _emit_error_payload(payload: dict[str, object]) -> None:
     sys.stderr.write(json.dumps(payload) + "\n")
 
 
+# ------------------------------------------------------------------- --output
+
+# Every subcommand that prints a JSON report accepts ``--output PATH`` to
+# export that report to a file instead of stdout. The export is only
+# committed once the report has been fully produced; it never changes the
+# payload bytes, the exit code, or any validation that precedes it.
+
+
+def _normalize_output_path(path: str) -> str:
+    """Absolutize and normalize a path for identity comparison and writing."""
+    return os.path.normpath(os.path.abspath(path))
+
+
+def _check_output_conflict(output_arg: str | None, input_paths: list[str]) -> int | None:
+    """Reject an export target that aliases one of this run's input files.
+
+    Returns ``None`` when there is no conflict (or no ``--output`` was
+    given); otherwise emits a single-line ``output_error`` on stderr and
+    returns exit code 2. The check runs after all inputs have been read,
+    parsed and validated (so the set of input files is known and original
+    failures keep precedence) but before any simulation or task re-run.
+    """
+    if output_arg is None:
+        return None
+    target = _normalize_output_path(output_arg)
+    for path in input_paths:
+        if _normalize_output_path(path) == target:
+            _emit_error(
+                "output_error",
+                f"output path {output_arg!r} conflicts with input file {path!r}",
+            )
+            return 2
+    return None
+
+
+def _write_result(line: str, output_arg: str | None) -> bool:
+    """Deliver one complete JSON result line to stdout or an ``--output`` file.
+
+    Without ``--output`` the line goes to stdout exactly as before. With
+    it, stdout stays empty and the line (including its trailing newline) is
+    written to the target atomically: the bytes are first written to a
+    temporary file in the same directory and then renamed over the target,
+    so a failed export never creates, truncates or replaces the target and
+    never leaves partial files behind. Returns ``True`` on success; on any
+    export failure emits a single-line ``output_error`` on stderr and
+    returns ``False`` (the caller then exits 1).
+    """
+    if output_arg is None:
+        sys.stdout.write(line)
+        return True
+
+    if output_arg == "-":
+        _emit_error("output_error", "output path must not be '-' (standard output)")
+        return False
+
+    target = _normalize_output_path(output_arg)
+    parent = os.path.dirname(target)
+    if not os.path.isdir(parent):
+        _emit_error(
+            "output_error",
+            f"cannot export output to {output_arg!r}: parent directory does not exist",
+        )
+        return False
+    if os.path.lexists(target) and not os.path.isfile(target):
+        _emit_error(
+            "output_error",
+            f"cannot export output to {output_arg!r}: target is not a regular file",
+        )
+        return False
+
+    data = line.encode("utf-8")
+    fd: int | None = None
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".output-", suffix=".tmp")
+        with os.fdopen(fd, "wb") as handle:
+            fd = None
+            handle.write(data)
+        os.replace(tmp_path, target)
+        tmp_path = None
+    except OSError as exc:
+        _emit_error(
+            "output_error",
+            f"cannot export output to {output_arg!r}: {exc.strerror or exc}",
+        )
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return True
+
+
+def _resolve_input_path(path: str, base_dir: str | None) -> str:
+    """Resolve an input path the way the readers open it.
+
+    With a *base_dir* (the batch case) relative paths are opened relative
+    to it; otherwise the path is used as given (relative to the current
+    working directory).
+    """
+    if base_dir is not None and not os.path.isabs(path):
+        return os.path.normpath(os.path.join(base_dir, path))
+    return path
+
+
+def _simulation_input_paths(
+    source_arg: str,
+    noise_model_arg: str | None,
+    base_dir: str | None = None,
+) -> list[str]:
+    """The non-stdin files one simulation input set reads, in read order."""
+    paths: list[str] = []
+    if source_arg != "-":
+        paths.append(_resolve_input_path(source_arg, base_dir))
+    if noise_model_arg is not None and noise_model_arg != "-":
+        paths.append(_resolve_input_path(noise_model_arg, base_dir))
+    return paths
+
+
 def _prepare_simulation(
     source_arg: str,
     noise_model_arg: str | None,
@@ -100,9 +224,7 @@ def _prepare_simulation(
     """
 
     def open_path(path: str) -> str:
-        if base_dir is not None and not os.path.isabs(path):
-            return os.path.normpath(os.path.join(base_dir, path))
-        return path
+        return _resolve_input_path(path, base_dir)
 
     if noise_model_arg is not None and source_arg == "-" and noise_model_arg == "-":
         return (
@@ -177,25 +299,18 @@ def _prepare_simulation(
     return program, noise_model, None, 0
 
 
-def _run_simulation(
-    source_arg: str,
+def _execute_simulation(
+    program: Program,
+    noise_model: dict[str, float] | None,
     shots: int,
     seed: int,
-    noise_model_arg: str | None,
-    base_dir: str | None = None,
 ) -> tuple[dict[str, object] | None, dict[str, object] | None, int]:
-    """Run one simulation with the exact semantics of ``simulate``.
+    """Compute one simulation result from an already-validated program.
 
-    Returns ``(output, error, exit_code)``: on success *error* is ``None``
-    and *output* is the payload printed by ``simulate``; on failure *output*
-    is ``None`` and *error* is the payload ``simulate`` would write to
-    stderr (including line/column where applicable).
+    Returns the same ``(output, error, exit_code)`` triple as
+    :func:`_run_simulation`; this is the computation half of that function,
+    with all reading, parsing and validation already done.
     """
-    program, noise_model, error, exit_code = _prepare_simulation(source_arg, noise_model_arg, base_dir)
-    if error is not None:
-        return None, error, exit_code
-    assert program is not None
-
     if noise_model is None:
         state = simulate_state_vector(program)
         counts = sample_counts(program, state, shots, seed)
@@ -232,12 +347,53 @@ def _run_simulation(
     return result, None, 0
 
 
-def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | None) -> int:
-    result, error, exit_code = _run_simulation(source_arg, shots, seed, noise_model_arg)
+def _run_simulation(
+    source_arg: str,
+    shots: int,
+    seed: int,
+    noise_model_arg: str | None,
+    base_dir: str | None = None,
+) -> tuple[dict[str, object] | None, dict[str, object] | None, int]:
+    """Run one simulation with the exact semantics of ``simulate``.
+
+    Returns ``(output, error, exit_code)``: on success *error* is ``None``
+    and *output* is the payload printed by ``simulate``; on failure *output*
+    is ``None`` and *error* is the payload ``simulate`` would write to
+    stderr (including line/column where applicable).
+    """
+    program, noise_model, error, exit_code = _prepare_simulation(source_arg, noise_model_arg, base_dir)
+    if error is not None:
+        return None, error, exit_code
+    assert program is not None
+    return _execute_simulation(program, noise_model, shots, seed)
+
+
+def _simulate(
+    source_arg: str,
+    shots: int,
+    seed: int,
+    noise_model_arg: str | None,
+    output_arg: str | None,
+) -> int:
+    program, noise_model, error, exit_code = _prepare_simulation(source_arg, noise_model_arg)
     if error is not None:
         _emit_error_payload(error)
         return exit_code
-    sys.stdout.write(json.dumps(result) + "\n")
+    assert program is not None
+
+    conflict = _check_output_conflict(
+        output_arg, _simulation_input_paths(source_arg, noise_model_arg)
+    )
+    if conflict is not None:
+        return conflict
+
+    result, error, exit_code = _execute_simulation(program, noise_model, shots, seed)
+    if error is not None:
+        _emit_error_payload(error)
+        return exit_code
+    assert result is not None
+    if not _write_result(json.dumps(result) + "\n", output_arg):
+        return 1
     return 0
 
 
@@ -302,12 +458,18 @@ def _probability_payload(
     }
 
 
-def _probabilities(source_arg: str, noise_model_arg: str | None) -> int:
+def _probabilities(source_arg: str, noise_model_arg: str | None, output_arg: str | None) -> int:
     program, noise_model, error, exit_code = _prepare_simulation(source_arg, noise_model_arg)
     if error is not None:
         _emit_error_payload(error)
         return exit_code
     assert program is not None
+
+    conflict = _check_output_conflict(
+        output_arg, _simulation_input_paths(source_arg, noise_model_arg)
+    )
+    if conflict is not None:
+        return conflict
 
     if noise_model is None:
         # Register sizes are already capped at 20 by the parser, matching
@@ -325,7 +487,8 @@ def _probabilities(source_arg: str, noise_model_arg: str | None) -> int:
         basis_probabilities = simulate_density_matrix(program, noise_model)
 
     result = _probability_payload(program, basis_probabilities, noise_model)
-    sys.stdout.write(json.dumps(result) + "\n")
+    if not _write_result(json.dumps(result) + "\n", output_arg):
+        return 1
     return 0
 
 
@@ -436,7 +599,26 @@ def _validate_batch_manifest(data: object) -> list[dict[str, object]]:
     return jobs
 
 
-def _batch_simulate(manifest_arg: str) -> int:
+def _manifest_input_paths(
+    manifest_arg: str,
+    jobs: list[dict[str, object]],
+    base_dir: str,
+) -> list[str]:
+    """The non-stdin files a validated batch run reads: manifest first, then
+    every referenced circuit and noise model in job order (resolved against
+    the manifest's base directory, exactly as the readers open them)."""
+    paths: list[str] = []
+    if manifest_arg != "-":
+        paths.append(manifest_arg)
+    for job in jobs:
+        paths.append(_resolve_input_path(job["source"], base_dir))
+        noise_model = job.get("noise_model")
+        if noise_model is not None:
+            paths.append(_resolve_input_path(noise_model, base_dir))
+    return paths
+
+
+def _batch_simulate(manifest_arg: str, output_arg: str | None) -> int:
     try:
         if manifest_arg == "-":
             raw_manifest = sys.stdin.buffer.read()
@@ -472,6 +654,12 @@ def _batch_simulate(manifest_arg: str) -> int:
         _emit_error("batch_input_error", message)
         return 2
 
+    conflict = _check_output_conflict(
+        output_arg, _manifest_input_paths(manifest_arg, jobs, base_dir)
+    )
+    if conflict is not None:
+        return conflict
+
     results: list[dict[str, object]] = []
     succeeded = 0
     for job in jobs:
@@ -495,7 +683,8 @@ def _batch_simulate(manifest_arg: str) -> int:
         "failed": len(jobs) - succeeded,
         "results": results,
     }
-    sys.stdout.write(json.dumps(summary) + "\n")
+    if not _write_result(json.dumps(summary) + "\n", output_arg):
+        return 1
     return 0 if succeeded == len(jobs) else 3
 
 
@@ -804,7 +993,7 @@ def _json_equal(expected: object, actual: object) -> bool:
     return expected == actual and type(expected) is type(actual)
 
 
-def _reconcile(manifest_arg: str, baseline_arg: str) -> int:
+def _reconcile(manifest_arg: str, baseline_arg: str, output_arg: str | None) -> int:
     if manifest_arg == "-" and baseline_arg == "-":
         # Standard input cannot serve both inputs; do not read it.
         _emit_error(
@@ -854,6 +1043,13 @@ def _reconcile(manifest_arg: str, baseline_arg: str) -> int:
         )
         _emit_error("reconcile_input_error", message)
         return 2
+
+    input_paths = _manifest_input_paths(manifest_arg, jobs, base_dir)
+    if baseline_arg != "-":
+        input_paths.append(baseline_arg)
+    conflict = _check_output_conflict(output_arg, input_paths)
+    if conflict is not None:
+        return conflict
 
     # Re-run every task in manifest order with the exact batch-simulate
     # semantics (reading, parsing, noise, qubit limits, sampling, errors).
@@ -909,7 +1105,8 @@ def _reconcile(manifest_arg: str, baseline_arg: str) -> int:
         "consistent": mismatched == 0,
         "results": entries,
     }
-    sys.stdout.write(json.dumps(report) + "\n")
+    if not _write_result(json.dumps(report) + "\n", output_arg):
+        return 1
     return 0 if mismatched == 0 else 3
 
 
@@ -936,7 +1133,7 @@ def _read_source(source_arg: str) -> str | None:
         return None
 
 
-def _optimize(source_arg: str) -> int:
+def _optimize(source_arg: str, output_arg: str | None) -> int:
     source = _read_source(source_arg)
     if source is None:
         return 1
@@ -949,6 +1146,12 @@ def _optimize(source_arg: str) -> int:
     except ValidationError as exc:
         _emit_error("validation_error", exc.message, exc.line, exc.column)
         return 2
+
+    conflict = _check_output_conflict(
+        output_arg, [] if source_arg == "-" else [source_arg]
+    )
+    if conflict is not None:
+        return conflict
 
     original_gate_count = sum(1 for op in program.operations if op.kind != "measure")
     gates, changed, qasm = optimize_program(program)
@@ -961,11 +1164,12 @@ def _optimize(source_arg: str) -> int:
         "changed": changed,
         "qasm": qasm,
     }
-    sys.stdout.write(json.dumps(result) + "\n")
+    if not _write_result(json.dumps(result) + "\n", output_arg):
+        return 1
     return 0
 
 
-def _estimate(source_arg: str, mode: str) -> int:
+def _estimate(source_arg: str, mode: str, output_arg: str | None) -> int:
     source = _read_source(source_arg)
     if source is None:
         return 1
@@ -979,7 +1183,14 @@ def _estimate(source_arg: str, mode: str) -> int:
         _emit_error("validation_error", exc.message, exc.line, exc.column)
         return 2
 
-    sys.stdout.write(json.dumps(estimate_program(program, mode)) + "\n")
+    conflict = _check_output_conflict(
+        output_arg, [] if source_arg == "-" else [source_arg]
+    )
+    if conflict is not None:
+        return conflict
+
+    if not _write_result(json.dumps(estimate_program(program, mode)) + "\n", output_arg):
+        return 1
     return 0
 
 
@@ -1045,7 +1256,7 @@ def _load_comparison_program(side: str, source_arg: str):
     return program, None
 
 
-def _equivalent(left_arg: str, right_arg: str) -> int:
+def _equivalent(left_arg: str, right_arg: str, output_arg: str | None) -> int:
     if left_arg == "-" and right_arg == "-":
         # Standard input cannot serve both sides; do not read it.
         _emit_error(
@@ -1063,6 +1274,12 @@ def _equivalent(left_arg: str, right_arg: str) -> int:
     if right is None:
         return error_code
 
+    conflict = _check_output_conflict(
+        output_arg, [arg for arg in (left_arg, right_arg) if arg != "-"]
+    )
+    if conflict is not None:
+        return conflict
+
     left_qubits = left.num_qubits
     right_qubits = right.num_qubits
 
@@ -1079,7 +1296,8 @@ def _equivalent(left_arg: str, right_arg: str) -> int:
             "distance": None,
             "tolerance": EQUIVALENCE_TOLERANCE,
         }
-        sys.stdout.write(json.dumps(result) + "\n")
+        if not _write_result(json.dumps(result) + "\n", output_arg):
+            return 1
         return 0
 
     distance = unitary_distance(unitary_matrix(left), unitary_matrix(right))
@@ -1106,11 +1324,12 @@ def _equivalent(left_arg: str, right_arg: str) -> int:
         "distance": distance,
         "tolerance": EQUIVALENCE_TOLERANCE,
     }
-    sys.stdout.write(json.dumps(result) + "\n")
+    if not _write_result(json.dumps(result) + "\n", output_arg):
+        return 1
     return 0
 
 
-def _state_metrics(left_arg: str, right_arg: str) -> int:
+def _state_metrics(left_arg: str, right_arg: str, output_arg: str | None) -> int:
     if left_arg == "-" and right_arg == "-":
         # Standard input cannot serve both sides; do not read it.
         _emit_error(
@@ -1127,6 +1346,12 @@ def _state_metrics(left_arg: str, right_arg: str) -> int:
     right, error_code = _load_program("right", right_arg)
     if right is None:
         return error_code
+
+    conflict = _check_output_conflict(
+        output_arg, [arg for arg in (left_arg, right_arg) if arg != "-"]
+    )
+    if conflict is not None:
+        return conflict
 
     left_state = simulate_state_vector(left)
     right_state = simulate_state_vector(right)
@@ -1147,7 +1372,8 @@ def _state_metrics(left_arg: str, right_arg: str) -> int:
         "left_single_qubit_entropy": single_qubit_entropies(left_state, left.num_qubits),
         "right_single_qubit_entropy": single_qubit_entropies(right_state, right.num_qubits),
     }
-    sys.stdout.write(json.dumps(result) + "\n")
+    if not _write_result(json.dumps(result) + "\n", output_arg):
+        return 1
     return 0
 
 
@@ -1159,6 +1385,14 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("version", help="print the current version")
 
+    def add_output_option(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument(
+            "--output",
+            metavar="PATH",
+            default=None,
+            help="optional path to write the JSON result to instead of stdout",
+        )
+
     simulate_parser = sub.add_parser("simulate", help="simulate an OpenQASM 2.0 subset circuit")
     simulate_parser.add_argument("source", help="path to the OpenQASM source file, or '-' for stdin")
     simulate_parser.add_argument("--shots", type=_positive_int, default=1024, help="number of samples (default: 1024)")
@@ -1169,6 +1403,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="optional JSON noise model for density-matrix simulation ('-' reads stdin)",
     )
+    add_output_option(simulate_parser)
 
     probabilities_parser = sub.add_parser(
         "probabilities",
@@ -1183,6 +1418,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="optional JSON noise model for density-matrix probabilities ('-' reads stdin)",
     )
+    add_output_option(probabilities_parser)
 
     equivalent_parser = sub.add_parser(
         "equivalent",
@@ -1190,12 +1426,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     equivalent_parser.add_argument("left", help="path to the left OpenQASM source file, or '-' for stdin")
     equivalent_parser.add_argument("right", help="path to the right OpenQASM source file, or '-' for stdin")
+    add_output_option(equivalent_parser)
 
     optimize_parser = sub.add_parser(
         "optimize",
         help="simplify an OpenQASM circuit into a deterministic canonical form",
     )
     optimize_parser.add_argument("source", help="path to the OpenQASM source file, or '-' for stdin")
+    add_output_option(optimize_parser)
 
     estimate_parser = sub.add_parser(
         "estimate",
@@ -1208,6 +1446,7 @@ def main(argv: list[str] | None = None) -> int:
         default="state-vector",
         help="simulation mode to size (default: state-vector)",
     )
+    add_output_option(estimate_parser)
 
     metrics_parser = sub.add_parser(
         "state-metrics",
@@ -1215,6 +1454,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     metrics_parser.add_argument("left", help="path to the left OpenQASM source file, or '-' for stdin")
     metrics_parser.add_argument("right", help="path to the right OpenQASM source file, or '-' for stdin")
+    add_output_option(metrics_parser)
 
     batch_parser = sub.add_parser(
         "batch-simulate",
@@ -1224,6 +1464,7 @@ def main(argv: list[str] | None = None) -> int:
         "manifest",
         help="path to the UTF-8 JSON batch manifest, or '-' for stdin",
     )
+    add_output_option(batch_parser)
 
     reconcile_parser = sub.add_parser(
         "reconcile",
@@ -1237,6 +1478,7 @@ def main(argv: list[str] | None = None) -> int:
         "baseline",
         help="path to the UTF-8 JSON batch-simulate result file, or '-' for stdin",
     )
+    add_output_option(reconcile_parser)
 
     args = parser.parse_args(argv)
 
@@ -1245,28 +1487,28 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "simulate":
-        return _simulate(args.source, args.shots, args.seed, args.noise_model)
+        return _simulate(args.source, args.shots, args.seed, args.noise_model, args.output)
 
     if args.command == "probabilities":
-        return _probabilities(args.source, args.noise_model)
+        return _probabilities(args.source, args.noise_model, args.output)
 
     if args.command == "batch-simulate":
-        return _batch_simulate(args.manifest)
+        return _batch_simulate(args.manifest, args.output)
 
     if args.command == "reconcile":
-        return _reconcile(args.manifest, args.baseline)
+        return _reconcile(args.manifest, args.baseline, args.output)
 
     if args.command == "equivalent":
-        return _equivalent(args.left, args.right)
+        return _equivalent(args.left, args.right, args.output)
 
     if args.command == "optimize":
-        return _optimize(args.source)
+        return _optimize(args.source, args.output)
 
     if args.command == "estimate":
-        return _estimate(args.source, args.mode)
+        return _estimate(args.source, args.mode, args.output)
 
     if args.command == "state-metrics":
-        return _state_metrics(args.left, args.right)
+        return _state_metrics(args.left, args.right, args.output)
 
     parser.print_help()
     return 0
