@@ -21,6 +21,7 @@ from __future__ import annotations
 import cmath
 import json
 import math
+from collections.abc import Mapping
 
 from .openqasm import Program
 
@@ -79,6 +80,32 @@ def parse_noise_model(text: str) -> dict[str, float]:
         if not 0.0 <= probability <= 1.0:
             raise NoiseModelError(f"noise channel {key!r} probability must be between 0 and 1")
     return {channel: float(data[channel]) for channel in CHANNEL_ORDER if channel in data}
+
+
+def validate_noise_model(model: object) -> dict[str, float]:
+    """Validate a noise model given directly as a mapping (the Python DSL).
+
+    Applies the same channel and probability rules as
+    :func:`parse_noise_model` and returns the same canonical mapping in
+    :data:`CHANNEL_ORDER` order with float probabilities, so a model passed
+    as a Python mapping behaves exactly like the equivalent JSON file.
+    Raises :class:`NoiseModelError` on any invalid content.
+    """
+    if isinstance(model, bool) or not isinstance(model, Mapping):
+        raise NoiseModelError("noise model must be a mapping of channel names to probabilities")
+    if not model:
+        raise NoiseModelError("noise model must configure at least one channel")
+    for key, value in model.items():
+        if not isinstance(key, str) or key not in CHANNEL_ORDER:
+            raise NoiseModelError(f"unknown noise channel {key!r}")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise NoiseModelError(f"noise channel {key!r} probability must be a number")
+        probability = float(value)
+        if not math.isfinite(probability):
+            raise NoiseModelError(f"noise channel {key!r} probability must be finite")
+        if not 0.0 <= probability <= 1.0:
+            raise NoiseModelError(f"noise channel {key!r} probability must be between 0 and 1")
+    return {channel: float(model[channel]) for channel in CHANNEL_ORDER if channel in model}
 
 
 def _basis_offsets(size: int, bit: int):

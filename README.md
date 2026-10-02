@@ -265,8 +265,26 @@ measure q[i] -> c[k];
 - `rx`、`ry`、`rz` 与受控旋转门 `crx`、`cry`、`crz` 恰好接收一个以弧度表示的角参数；`cz` 在控制位与目标位都为 1 时引入负相位，受控旋转仅在控制位为 1 时对目标位施加对应旋转；控制位与目标位相同属于语义错误；角表达式支持十进制整数、实数（含科学计数法）、常量 `pi`、圆括号、一元 `+`/`-` 以及二元 `+`、`-`、`*`、`/`（乘除优先于加减，同级从左到右，括号优先）。
 - 测量只能出现在所有量子门之后，每个量子位、经典位最多参与一次测量。
 
-### 结果导出（`--output PATH`）
+### Python 线路 DSL
 
+包入口导出 `Circuit` 类型，可在 Python 中直接构造与 OpenQASM 子集等价的线路：
+
+```python
+from quantum_circuit import Circuit
+
+circuit = Circuit(2, 2).h(0).cx(0, 1).measure(0, 0).measure(1, 1)
+print(circuit.to_qasm())          # OpenQASM 2.0 子集文本（寄存器名固定为 q、c，末尾换行）
+counts = circuit.sample()         # 与 simulate 命令的 JSON 对象一致的字典（默认 shots=1024、seed=0）
+probs = circuit.probabilities()   # 与 probabilities 命令的 JSON 对象一致的字典
+```
+
+- `Circuit(num_qubits, num_clbits)`：寄存器尺寸为 1 至 20 的整数（拒绝布尔值）。链式方法 `x`、`h`、`cx`、`cz`、`rx`、`ry`、`rz`、`crx`、`cry`、`crz` 与逐位 `measure(qubit, clbit)` 按加入顺序追加操作并返回同一线路对象；旋转门签名为 `rx(angle, qubit)`、`crx(angle, control, target)`。
+- 下标必须是非布尔整数且在对应寄存器范围内；受控门的控制位与目标位不得相同；角度只接受有限的整数或浮点数。每个量子位、经典位最多参与一次测量，测量开始后不能再添加量子门。类型不符抛出 `TypeError`，越界、非有限角度及语义冲突抛出 `ValueError`；失败的追加不改变线路。
+- `to_qasm()` 生成可被本仓库解析器接受的 OpenQASM 文本，角度使用可还原为同一浮点值的最短十进制表示（负零写作 `0`）；`Circuit.from_qasm(text)` 从文本创建线路，解析与语义错误继续抛出 `ParseError`/`ValidationError` 并保留行列位置。
+- `sample(shots=1024, seed=0, noise_model=None)` 与 `probabilities(noise_model=None)` 复用命令行的仿真与采样路径，返回字典与同一线路经 `simulate`/`probabilities` 命令得到的 JSON 对象字段与值完全一致（含默认参数、测量位序、无测量结果、噪声通道顺序与量子位上限）；调用不修改线路，相同参数的重复调用返回相等结果，且各次调用不共享随机状态。`noise_model` 直接接受映射，沿用四类通道与概率校验，非法模型抛出 `NoiseModelError`；`shots` 非正或非整数、`seed` 非整数分别抛出 `ValueError`/`TypeError`。
+- 包同时导出 `ParseError`、`ValidationError` 与 `NoiseModelError`；`quantum_circuit.__version__` 保持不变。
+
+### 结果导出（`--output PATH`）
 `simulate`、`probabilities`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 八个子命令均支持可选的 `--output PATH`，用于把结果直接导出到文件，调用方无需再重定向标准输出。
 
 - 省略该选项时，stdout、stderr、退出码及字节内容与既有行为完全一致。
@@ -323,7 +341,7 @@ measure q[i] -> c[k];
 ## 现有公开接口
 
 - 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`probabilities`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
-- Python 包 `quantum_circuit`，其 `__version__` 为当前版本号
+- Python 包 `quantum_circuit`，其 `__version__` 为当前版本号，并导出 `Circuit` 线路 DSL（见「Python 线路 DSL」一节）及 `ParseError`、`ValidationError`、`NoiseModelError` 异常类型
 
 ## 限制
 
