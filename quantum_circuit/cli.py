@@ -6,7 +6,9 @@ import argparse
 import json
 import math
 import os
+import stat
 import sys
+import tempfile
 
 from . import __version__
 from .equivalence import (
@@ -75,10 +77,162 @@ def _emit_error_payload(payload: dict[str, object]) -> None:
     sys.stderr.write(json.dumps(payload) + "\n")
 
 
+# ------------------------------------------------------------- result export
+
+
+class _RunContext:
+    """Track the optional ``--output PATH`` target and every input file read.
+
+    The target is absolutized once (anchored at the invocation working
+    directory). Every non-stdin input the command reads is registered using
+    the same path resolution used to open it, so an export that would
+    overwrite a reproducibility input can be refused before any result is
+    computed.
+    """
+
+    def __init__(self, output: str | None):
+        self.output_arg = output
+        self.target: str | None = None if output is None else os.path.abspath(output)
+        self.inputs: set[str] = set()
+
+    def register_input(self, path: str, base_dir: str | None = None) -> None:
+        if self.target is None or path == "-":
+            return
+        if base_dir is not None and not os.path.isabs(path):
+            resolved = os.path.join(base_dir, path)
+        else:
+            resolved = path
+        self.inputs.add(os.path.abspath(resolved))
+
+
+def _guard_output_conflict(ctx: _RunContext) -> int | None:
+    """Refuse to export over an input file (``output_error``, exit code 2).
+
+    Invoked only after the command's own validation has succeeded but
+    before any result-producing computation runs, so no simulation or
+    re-run task executes and no file is modified.
+    """
+    if ctx.target is not None and ctx.target in ctx.inputs:
+        _emit_error(
+            "output_error",
+            f"output path {ctx.output_arg!r} is the same file as an input read by this command",
+        )
+        return 2
+    return None
+
+
+def _register_manifest_references(
+    ctx: _RunContext,
+    jobs: list[dict[str, object]],
+    base_dir: str | None,
+) -> None:
+    """Register every circuit/noise path a *validated* manifest names.
+
+    Conflict protection is based on the manifest's declared references,
+    not only on files that opened successfully, so a failed task cannot
+    export a report over a path a later re-run would treat as input. The
+    manifest is structurally valid at this point (paths are non-``-``
+    strings); a missing or unreadable file is still covered.
+    """
+    if ctx.target is None:
+        return
+    for job in jobs:
+        source = str(job["source"])
+        ctx.register_input(source, base_dir)
+        noise_model = job.get("noise_model")
+        if noise_model is not None:
+            ctx.register_input(str(noise_model), base_dir)
+
+
+def _write_output_atomic(target: str, data: bytes) -> str | None:
+    """Write *data* to *target* without ever leaving a partial result.
+
+    Returns ``None`` on success, otherwise a human-readable error message.
+    The data lands in a temporary file in the target's parent directory and
+    is moved into place atomically, so a failure leaves any pre-existing
+    target byte-for-byte unchanged and removes the temporary file.
+    """
+    parent = os.path.dirname(target) or "."
+    if not os.path.isdir(parent):
+        return f"cannot write output {target!r}: parent directory does not exist"
+
+    # The target may be a new file or an existing regular file. Symlinks are
+    # followed (a link to a regular file is a valid target; os.replace swaps
+    # the link itself without touching its referent), while a directory --
+    # including a symlink to one -- and other non-regular types are refused.
+    try:
+        existing = os.stat(target)
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        return f"cannot write output {target!r}: {exc.strerror or exc}"
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        kind = "a directory" if stat.S_ISDIR(existing.st_mode) else "not a regular file"
+        return f"cannot write output {target!r}: target is {kind}"
+
+    tmp_name: str | None = None
+    try:
+        try:
+            fd, tmp_name = tempfile.mkstemp(prefix=".qcs-output-", suffix=".tmp", dir=parent)
+        except OSError as exc:
+            return f"cannot write output {target!r}: {exc.strerror or exc}"
+        try:
+            # A new file gets the usual umask-derived mode; overwriting an
+            # existing regular file keeps its permissions (as open("w") would).
+            current_umask = os.umask(0)
+            os.umask(current_umask)
+            mode = (
+                stat.S_IMODE(existing.st_mode)
+                if existing is not None
+                else 0o666 & ~current_umask
+            )
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            return f"cannot write output {target!r}: {exc.strerror or exc}"
+        try:
+            os.replace(tmp_name, target)
+        except OSError as exc:
+            return f"cannot write output {target!r}: {exc.strerror or exc}"
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    return None
+
+
+def _finish(ctx: _RunContext | None, result: dict[str, object], exit_code: int) -> int:
+    """Emit a ready result: stdout as before, or the exported file.
+
+    With no ``--output`` the stdout/stderr/exit behavior is exactly the
+    historical one. With an export, stdout stays empty and the original
+    exit code (including the batch/reconcile code 3) is preserved whenever
+    the file lands; an export failure is an ``output_error`` with code 1.
+    """
+    if ctx is None or ctx.target is None:
+        sys.stdout.write(json.dumps(result) + "\n")
+        return exit_code
+    if ctx.output_arg == "-":
+        _emit_error("output_error", "output path must not be '-'")
+        return 1
+    message = _write_output_atomic(ctx.target, (json.dumps(result) + "\n").encode("utf-8"))
+    if message is not None:
+        _emit_error("output_error", message)
+        return 1
+    return exit_code
+
+
 def _prepare_simulation(
     source_arg: str,
     noise_model_arg: str | None,
     base_dir: str | None = None,
+    ctx: _RunContext | None = None,
 ) -> tuple[Program | None, dict[str, float] | None, dict[str, object] | None, int]:
     """Read, decode, parse and validate one simulation input.
 
@@ -104,6 +258,10 @@ def _prepare_simulation(
             return os.path.normpath(os.path.join(base_dir, path))
         return path
 
+    def register(path: str) -> None:
+        if ctx is not None:
+            ctx.register_input(path, base_dir)
+
     if noise_model_arg is not None and source_arg == "-" and noise_model_arg == "-":
         return (
             None,
@@ -115,16 +273,20 @@ def _prepare_simulation(
             2,
         )
 
+    if source_arg != "-":
+        source_resolved = open_path(source_arg)
     try:
         if source_arg == "-":
             data = sys.stdin.buffer.read()
         else:
-            with open(open_path(source_arg), "rb") as handle:
+            with open(source_resolved, "rb") as handle:
                 data = handle.read()
     except OSError as exc:
         return None, None, _error_payload(
             "io_error", f"cannot read source {source_arg!r}: {exc.strerror or exc}"
         ), 1
+    if source_arg != "-":
+        register(source_arg)
 
     try:
         source = data.decode("utf-8")
@@ -135,11 +297,13 @@ def _prepare_simulation(
 
     noise_model: dict[str, float] | None = None
     if noise_model_arg is not None:
+        if noise_model_arg != "-":
+            noise_resolved = open_path(noise_model_arg)
         try:
             if noise_model_arg == "-":
                 raw_model = sys.stdin.buffer.read()
             else:
-                with open(open_path(noise_model_arg), "rb") as handle:
+                with open(noise_resolved, "rb") as handle:
                     raw_model = handle.read()
         except OSError as exc:
             return (
@@ -150,6 +314,8 @@ def _prepare_simulation(
                 ),
                 1,
             )
+        if noise_model_arg != "-":
+            register(noise_model_arg)
         try:
             model_text = raw_model.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -177,25 +343,18 @@ def _prepare_simulation(
     return program, noise_model, None, 0
 
 
-def _run_simulation(
-    source_arg: str,
+def _compute_simulation(
+    program: Program,
+    noise_model: dict[str, float] | None,
     shots: int,
     seed: int,
-    noise_model_arg: str | None,
-    base_dir: str | None = None,
 ) -> tuple[dict[str, object] | None, dict[str, object] | None, int]:
-    """Run one simulation with the exact semantics of ``simulate``.
+    """Evolve a prepared circuit and sample it (the ``simulate`` payload).
 
-    Returns ``(output, error, exit_code)``: on success *error* is ``None``
-    and *output* is the payload printed by ``simulate``; on failure *output*
-    is ``None`` and *error* is the payload ``simulate`` would write to
-    stderr (including line/column where applicable).
+    Companion to :func:`_prepare_simulation`; reading and parsing happen
+    there, size checks and evolution here, so an output conflict can be
+    refused between the two without running a simulation.
     """
-    program, noise_model, error, exit_code = _prepare_simulation(source_arg, noise_model_arg, base_dir)
-    if error is not None:
-        return None, error, exit_code
-    assert program is not None
-
     if noise_model is None:
         state = simulate_state_vector(program)
         counts = sample_counts(program, state, shots, seed)
@@ -232,13 +391,28 @@ def _run_simulation(
     return result, None, 0
 
 
-def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | None) -> int:
-    result, error, exit_code = _run_simulation(source_arg, shots, seed, noise_model_arg)
+def _simulate(
+    source_arg: str,
+    shots: int,
+    seed: int,
+    noise_model_arg: str | None,
+    ctx: _RunContext | None = None,
+) -> int:
+    program, noise_model, error, exit_code = _prepare_simulation(
+        source_arg, noise_model_arg, ctx=ctx
+    )
     if error is not None:
         _emit_error_payload(error)
         return exit_code
-    sys.stdout.write(json.dumps(result) + "\n")
-    return 0
+    if ctx is not None and (code := _guard_output_conflict(ctx)) is not None:
+        return code
+    assert program is not None
+    result, error, exit_code = _compute_simulation(program, noise_model, shots, seed)
+    if error is not None:
+        _emit_error_payload(error)
+        return exit_code
+    assert result is not None
+    return _finish(ctx, result, 0)
 
 
 # --------------------------------------------------------------- probabilities
@@ -302,12 +476,18 @@ def _probability_payload(
     }
 
 
-def _probabilities(source_arg: str, noise_model_arg: str | None) -> int:
-    program, noise_model, error, exit_code = _prepare_simulation(source_arg, noise_model_arg)
+def _probabilities(
+    source_arg: str, noise_model_arg: str | None, ctx: _RunContext | None = None
+) -> int:
+    program, noise_model, error, exit_code = _prepare_simulation(source_arg, noise_model_arg, ctx=ctx)
     if error is not None:
         _emit_error_payload(error)
         return exit_code
     assert program is not None
+
+    # Refuse an input-overwriting export before any state is evolved.
+    if ctx is not None and (code := _guard_output_conflict(ctx)) is not None:
+        return code
 
     if noise_model is None:
         # Register sizes are already capped at 20 by the parser, matching
@@ -325,8 +505,7 @@ def _probabilities(source_arg: str, noise_model_arg: str | None) -> int:
         basis_probabilities = simulate_density_matrix(program, noise_model)
 
     result = _probability_payload(program, basis_probabilities, noise_model)
-    sys.stdout.write(json.dumps(result) + "\n")
-    return 0
+    return _finish(ctx, result, 0)
 
 
 # ------------------------------------------------------------- batch-simulate
@@ -436,7 +615,7 @@ def _validate_batch_manifest(data: object) -> list[dict[str, object]]:
     return jobs
 
 
-def _batch_simulate(manifest_arg: str) -> int:
+def _batch_simulate(manifest_arg: str, ctx: _RunContext | None = None) -> int:
     try:
         if manifest_arg == "-":
             raw_manifest = sys.stdin.buffer.read()
@@ -448,6 +627,8 @@ def _batch_simulate(manifest_arg: str) -> int:
     except OSError as exc:
         _emit_error("io_error", f"cannot read manifest {manifest_arg!r}: {exc.strerror or exc}")
         return 1
+    if ctx is not None and manifest_arg != "-":
+        ctx.register_input(manifest_arg)
 
     try:
         manifest_text = raw_manifest.decode("utf-8")
@@ -472,16 +653,41 @@ def _batch_simulate(manifest_arg: str) -> int:
         _emit_error("batch_input_error", message)
         return 2
 
+    # Register every path the validated manifest names, then guard against
+    # an input-overwriting export before any task file is opened or any
+    # simulation runs. References are registered from the manifest itself,
+    # so a missing/unreadable task is still covered.
+    if ctx is not None:
+        _register_manifest_references(ctx, jobs, base_dir)
+        if (code := _guard_output_conflict(ctx)) is not None:
+            return code
+
+    # Read, decode, parse and validate every task first (task failures are
+    # embedded), then evolve each prepared circuit in manifest order.
+    prepared: list[
+        tuple[dict[str, object], Program | None, dict[str, float] | None, dict[str, object] | None]
+    ] = []
+    for job in jobs:
+        program, noise_model, error, _exit_code = _prepare_simulation(
+            job["source"],
+            job.get("noise_model"),
+            base_dir,
+            ctx,
+        )
+        prepared.append((job, program, noise_model, error))
+
     results: list[dict[str, object]] = []
     succeeded = 0
-    for job in jobs:
-        output, error, _exit_code = _run_simulation(
-            job["source"],
-            job.get("shots", 1024),
-            job.get("seed", 0),
-            job.get("noise_model"),
-            base_dir=base_dir,
-        )
+    for job, program, noise_model, error in prepared:
+        output: dict[str, object] | None = None
+        if error is None:
+            assert program is not None
+            output, error, _exit_code = _compute_simulation(
+                program,
+                noise_model,
+                job.get("shots", 1024),
+                job.get("seed", 0),
+            )
         if error is None:
             succeeded += 1
             results.append({"id": job["id"], "status": "succeeded", "output": output})
@@ -495,8 +701,7 @@ def _batch_simulate(manifest_arg: str) -> int:
         "failed": len(jobs) - succeeded,
         "results": results,
     }
-    sys.stdout.write(json.dumps(summary) + "\n")
-    return 0 if succeeded == len(jobs) else 3
+    return _finish(ctx, summary, 0 if succeeded == len(jobs) else 3)
 
 
 # --------------------------------------------------------------- reconcile
@@ -755,7 +960,9 @@ def _validate_baseline(data: object, jobs: list[dict[str, object]]) -> list[dict
     return results
 
 
-def _read_reconcile_input(side: str, arg: str) -> tuple[bytes, str | None, int | None]:
+def _read_reconcile_input(
+    side: str, arg: str, ctx: _RunContext | None = None
+) -> tuple[bytes, str | None, int | None]:
     """Read one reconcile input, returning ``(raw_bytes, base_dir, error_code)``.
 
     *side* is ``"manifest"`` or ``"baseline"`` and is reported on every
@@ -784,6 +991,9 @@ def _read_reconcile_input(side: str, arg: str) -> tuple[bytes, str | None, int |
         _emit_error("io_error", f"{side} {arg!r} is not valid UTF-8: {exc}", side=side)
         return b"", None, 1
 
+    if ctx is not None and arg != "-":
+        ctx.register_input(arg)
+
     return raw, base_dir, None
 
 
@@ -804,7 +1014,7 @@ def _json_equal(expected: object, actual: object) -> bool:
     return expected == actual and type(expected) is type(actual)
 
 
-def _reconcile(manifest_arg: str, baseline_arg: str) -> int:
+def _reconcile(manifest_arg: str, baseline_arg: str, ctx: _RunContext | None = None) -> int:
     if manifest_arg == "-" and baseline_arg == "-":
         # Standard input cannot serve both inputs; do not read it.
         _emit_error(
@@ -815,10 +1025,10 @@ def _reconcile(manifest_arg: str, baseline_arg: str) -> int:
 
     # Read and decode both inputs fully (manifest first, then baseline) and
     # validate both before any task file is touched.
-    raw_manifest, base_dir, code = _read_reconcile_input("manifest", manifest_arg)
+    raw_manifest, base_dir, code = _read_reconcile_input("manifest", manifest_arg, ctx)
     if code is not None:
         return code
-    raw_baseline, _base_dir, code = _read_reconcile_input("baseline", baseline_arg)
+    raw_baseline, _base_dir, code = _read_reconcile_input("baseline", baseline_arg, ctx)
     if code is not None:
         return code
 
@@ -855,18 +1065,42 @@ def _reconcile(manifest_arg: str, baseline_arg: str) -> int:
         _emit_error("reconcile_input_error", message)
         return 2
 
+    # Register every path the validated manifest names (plus the manifest
+    # and baseline already read), then guard against an input-overwriting
+    # export before any task file is opened or any task is re-run.
+    if ctx is not None:
+        _register_manifest_references(ctx, jobs, base_dir)
+        if (code := _guard_output_conflict(ctx)) is not None:
+            return code
+
+    # Prepare (read, parse, validate) every task first, then re-run them in
+    # manifest order with the exact batch-simulate semantics.
+    prepared: list[
+        tuple[dict[str, object], Program | None, dict[str, float] | None, dict[str, object] | None]
+    ] = []
+    for job in jobs:
+        program, noise_model, error, _exit_code = _prepare_simulation(
+            job["source"],
+            job.get("noise_model"),
+            base_dir,
+            ctx,
+        )
+        prepared.append((job, program, noise_model, error))
+
     # Re-run every task in manifest order with the exact batch-simulate
     # semantics (reading, parsing, noise, qubit limits, sampling, errors).
     entries: list[dict[str, object]] = []
     matched = 0
-    for job, reference in zip(jobs, baseline_results):
-        output, error, _exit_code = _run_simulation(
-            job["source"],
-            job.get("shots", 1024),
-            job.get("seed", 0),
-            job.get("noise_model"),
-            base_dir=base_dir,
-        )
+    for (job, program, noise_model, error), reference in zip(prepared, baseline_results):
+        output: dict[str, object] | None = None
+        if error is None:
+            assert program is not None
+            output, error, _exit_code = _compute_simulation(
+                program,
+                noise_model,
+                job.get("shots", 1024),
+                job.get("seed", 0),
+            )
         current: dict[str, object] = (
             {"id": job["id"], "status": "succeeded", "output": output}
             if error is None
@@ -909,11 +1143,10 @@ def _reconcile(manifest_arg: str, baseline_arg: str) -> int:
         "consistent": mismatched == 0,
         "results": entries,
     }
-    sys.stdout.write(json.dumps(report) + "\n")
-    return 0 if mismatched == 0 else 3
+    return _finish(ctx, report, 0 if mismatched == 0 else 3)
 
 
-def _read_source(source_arg: str) -> str | None:
+def _read_source(source_arg: str, ctx: _RunContext | None = None) -> str | None:
     """Read a UTF-8 circuit source from a path or ``-`` (stdin).
 
     Returns the decoded source, or ``None`` after emitting a single-line
@@ -930,25 +1163,43 @@ def _read_source(source_arg: str) -> str | None:
         return None
 
     try:
-        return data.decode("utf-8")
+        source = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         _emit_error("io_error", f"source {source_arg!r} is not valid UTF-8: {exc}")
         return None
 
+    if ctx is not None and source_arg != "-":
+        ctx.register_input(source_arg)
+    return source
 
-def _optimize(source_arg: str) -> int:
-    source = _read_source(source_arg)
-    if source is None:
-        return 1
 
+def _parse_or_emit(source: str) -> tuple[Program | None, int | None]:
+    """Parse/validate one circuit source, emitting the standard error line.
+
+    Returns ``(program, None)`` on success or ``(None, exit_code)`` after a
+    ``parse_error``/``validation_error`` line has been written.
+    """
     try:
         program = parse(source)
     except ParseError as exc:
         _emit_error("parse_error", exc.message, exc.line, exc.column)
-        return 2
+        return None, 2
     except ValidationError as exc:
         _emit_error("validation_error", exc.message, exc.line, exc.column)
-        return 2
+        return None, 2
+    return program, None
+
+
+def _optimize(source_arg: str, ctx: _RunContext | None = None) -> int:
+    source = _read_source(source_arg, ctx)
+    if source is None:
+        return 1
+
+    program, code = _parse_or_emit(source)
+    if program is None:
+        return code if code is not None else 2
+    if ctx is not None and (guard := _guard_output_conflict(ctx)) is not None:
+        return guard
 
     original_gate_count = sum(1 for op in program.operations if op.kind != "measure")
     gates, changed, qasm = optimize_program(program)
@@ -961,29 +1212,24 @@ def _optimize(source_arg: str) -> int:
         "changed": changed,
         "qasm": qasm,
     }
-    sys.stdout.write(json.dumps(result) + "\n")
-    return 0
+    return _finish(ctx, result, 0)
 
 
-def _estimate(source_arg: str, mode: str) -> int:
-    source = _read_source(source_arg)
+def _estimate(source_arg: str, mode: str, ctx: _RunContext | None = None) -> int:
+    source = _read_source(source_arg, ctx)
     if source is None:
         return 1
 
-    try:
-        program = parse(source)
-    except ParseError as exc:
-        _emit_error("parse_error", exc.message, exc.line, exc.column)
-        return 2
-    except ValidationError as exc:
-        _emit_error("validation_error", exc.message, exc.line, exc.column)
-        return 2
+    program, code = _parse_or_emit(source)
+    if program is None:
+        return code if code is not None else 2
+    if ctx is not None and (guard := _guard_output_conflict(ctx)) is not None:
+        return guard
 
-    sys.stdout.write(json.dumps(estimate_program(program, mode)) + "\n")
-    return 0
+    return _finish(ctx, estimate_program(program, mode), 0)
 
 
-def _load_program(side: str, source_arg: str):
+def _load_program(side: str, source_arg: str, ctx: _RunContext | None = None):
     """Read, parse and validate one side of a two-circuit comparison.
 
     Returns the parsed :class:`Program`, or an exit code (1 or 2) after
@@ -1020,16 +1266,20 @@ def _load_program(side: str, source_arg: str):
         _emit_error("validation_error", exc.message, exc.line, exc.column, side=side)
         return None, 2
 
+    if ctx is not None and source_arg != "-":
+        ctx.register_input(source_arg)
     return program, None
 
 
-def _load_comparison_program(side: str, source_arg: str):
+def _load_comparison_program(
+    side: str, source_arg: str, ctx: _RunContext | None = None
+):
     """Load one side of an equivalence comparison, enforcing the size cap.
 
     Like :func:`_load_program`, but additionally rejects circuits larger
     than ``MAX_EQUIVALENCE_QUBITS`` with exit code 3.
     """
-    program, error_code = _load_program(side, source_arg)
+    program, error_code = _load_program(side, source_arg, ctx)
     if program is None:
         return None, error_code
 
@@ -1045,7 +1295,7 @@ def _load_comparison_program(side: str, source_arg: str):
     return program, None
 
 
-def _equivalent(left_arg: str, right_arg: str) -> int:
+def _equivalent(left_arg: str, right_arg: str, ctx: _RunContext | None = None) -> int:
     if left_arg == "-" and right_arg == "-":
         # Standard input cannot serve both sides; do not read it.
         _emit_error(
@@ -1056,12 +1306,15 @@ def _equivalent(left_arg: str, right_arg: str) -> int:
 
     # Fully validate each side (read, parse, semantics, size) in LEFT, RIGHT
     # order, reporting only the first failure.
-    left, error_code = _load_comparison_program("left", left_arg)
+    left, error_code = _load_comparison_program("left", left_arg, ctx)
     if left is None:
         return error_code
-    right, error_code = _load_comparison_program("right", right_arg)
+    right, error_code = _load_comparison_program("right", right_arg, ctx)
     if right is None:
         return error_code
+
+    if ctx is not None and (guard := _guard_output_conflict(ctx)) is not None:
+        return guard
 
     left_qubits = left.num_qubits
     right_qubits = right.num_qubits
@@ -1079,8 +1332,7 @@ def _equivalent(left_arg: str, right_arg: str) -> int:
             "distance": None,
             "tolerance": EQUIVALENCE_TOLERANCE,
         }
-        sys.stdout.write(json.dumps(result) + "\n")
-        return 0
+        return _finish(ctx, result, 0)
 
     distance = unitary_distance(unitary_matrix(left), unitary_matrix(right))
 
@@ -1106,11 +1358,10 @@ def _equivalent(left_arg: str, right_arg: str) -> int:
         "distance": distance,
         "tolerance": EQUIVALENCE_TOLERANCE,
     }
-    sys.stdout.write(json.dumps(result) + "\n")
-    return 0
+    return _finish(ctx, result, 0)
 
 
-def _state_metrics(left_arg: str, right_arg: str) -> int:
+def _state_metrics(left_arg: str, right_arg: str, ctx: _RunContext | None = None) -> int:
     if left_arg == "-" and right_arg == "-":
         # Standard input cannot serve both sides; do not read it.
         _emit_error(
@@ -1121,12 +1372,15 @@ def _state_metrics(left_arg: str, right_arg: str) -> int:
 
     # Fully validate each side (read, parse, semantics) in LEFT, RIGHT
     # order, reporting only the first failure.
-    left, error_code = _load_program("left", left_arg)
+    left, error_code = _load_program("left", left_arg, ctx)
     if left is None:
         return error_code
-    right, error_code = _load_program("right", right_arg)
+    right, error_code = _load_program("right", right_arg, ctx)
     if right is None:
         return error_code
+
+    if ctx is not None and (guard := _guard_output_conflict(ctx)) is not None:
+        return guard
 
     left_state = simulate_state_vector(left)
     right_state = simulate_state_vector(right)
@@ -1147,8 +1401,7 @@ def _state_metrics(left_arg: str, right_arg: str) -> int:
         "left_single_qubit_entropy": single_qubit_entropies(left_state, left.num_qubits),
         "right_single_qubit_entropy": single_qubit_entropies(right_state, right.num_qubits),
     }
-    sys.stdout.write(json.dumps(result) + "\n")
-    return 0
+    return _finish(ctx, result, 0)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1169,6 +1422,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="optional JSON noise model for density-matrix simulation ('-' reads stdin)",
     )
+    simulate_parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
+    )
 
     probabilities_parser = sub.add_parser(
         "probabilities",
@@ -1183,6 +1442,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="optional JSON noise model for density-matrix probabilities ('-' reads stdin)",
     )
+    probabilities_parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
+    )
 
     equivalent_parser = sub.add_parser(
         "equivalent",
@@ -1190,12 +1455,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     equivalent_parser.add_argument("left", help="path to the left OpenQASM source file, or '-' for stdin")
     equivalent_parser.add_argument("right", help="path to the right OpenQASM source file, or '-' for stdin")
+    equivalent_parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
+    )
 
     optimize_parser = sub.add_parser(
         "optimize",
         help="simplify an OpenQASM circuit into a deterministic canonical form",
     )
     optimize_parser.add_argument("source", help="path to the OpenQASM source file, or '-' for stdin")
+    optimize_parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
+    )
 
     estimate_parser = sub.add_parser(
         "estimate",
@@ -1208,6 +1485,12 @@ def main(argv: list[str] | None = None) -> int:
         default="state-vector",
         help="simulation mode to size (default: state-vector)",
     )
+    estimate_parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
+    )
 
     metrics_parser = sub.add_parser(
         "state-metrics",
@@ -1215,6 +1498,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     metrics_parser.add_argument("left", help="path to the left OpenQASM source file, or '-' for stdin")
     metrics_parser.add_argument("right", help="path to the right OpenQASM source file, or '-' for stdin")
+    metrics_parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
+    )
 
     batch_parser = sub.add_parser(
         "batch-simulate",
@@ -1223,6 +1512,12 @@ def main(argv: list[str] | None = None) -> int:
     batch_parser.add_argument(
         "manifest",
         help="path to the UTF-8 JSON batch manifest, or '-' for stdin",
+    )
+    batch_parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
     )
 
     reconcile_parser = sub.add_parser(
@@ -1237,6 +1532,12 @@ def main(argv: list[str] | None = None) -> int:
         "baseline",
         help="path to the UTF-8 JSON batch-simulate result file, or '-' for stdin",
     )
+    reconcile_parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -1244,29 +1545,31 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
 
+    ctx = _RunContext(args.output) if getattr(args, "output", None) is not None else None
+
     if args.command == "simulate":
-        return _simulate(args.source, args.shots, args.seed, args.noise_model)
+        return _simulate(args.source, args.shots, args.seed, args.noise_model, ctx)
 
     if args.command == "probabilities":
-        return _probabilities(args.source, args.noise_model)
+        return _probabilities(args.source, args.noise_model, ctx)
 
     if args.command == "batch-simulate":
-        return _batch_simulate(args.manifest)
+        return _batch_simulate(args.manifest, ctx)
 
     if args.command == "reconcile":
-        return _reconcile(args.manifest, args.baseline)
+        return _reconcile(args.manifest, args.baseline, ctx)
 
     if args.command == "equivalent":
-        return _equivalent(args.left, args.right)
+        return _equivalent(args.left, args.right, ctx)
 
     if args.command == "optimize":
-        return _optimize(args.source)
+        return _optimize(args.source, ctx)
 
     if args.command == "estimate":
-        return _estimate(args.source, args.mode)
+        return _estimate(args.source, args.mode, ctx)
 
     if args.command == "state-metrics":
-        return _state_metrics(args.left, args.right)
+        return _state_metrics(args.left, args.right, ctx)
 
     parser.print_help()
     return 0

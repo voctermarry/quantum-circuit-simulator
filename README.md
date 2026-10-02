@@ -38,7 +38,7 @@ quantum-circuit-simulator estimate circuit.qasm      # 静态预估线路规模�
 ### simulate 子命令
 
 ```bash
-quantum-circuit-simulator simulate SOURCE [--shots N] [--seed S] [--noise-model PATH]
+quantum-circuit-simulator simulate SOURCE [--shots N] [--seed S] [--noise-model PATH] [--output PATH]
 ```
 
 - `SOURCE`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取。
@@ -70,7 +70,7 @@ quantum-circuit-simulator simulate SOURCE [--shots N] [--seed S] [--noise-model 
 ### probabilities 子命令
 
 ```bash
-quantum-circuit-simulator probabilities SOURCE [--noise-model PATH]
+quantum-circuit-simulator probabilities SOURCE [--noise-model PATH] [--output PATH]
 ```
 
 - `SOURCE` 与 `--noise-model` 的文件、UTF-8、标准输入（`-`）与相对路径语义完全沿用 `simulate`；两者不能同时为 `-`（违反时不读取标准输入）。命令不接受 `--shots` 或 `--seed`，不进行采样，因此输出不包含随机性。
@@ -91,7 +91,7 @@ quantum-circuit-simulator probabilities SOURCE [--noise-model PATH]
 ### batch-simulate 子命令
 
 ```bash
-quantum-circuit-simulator batch-simulate MANIFEST
+quantum-circuit-simulator batch-simulate MANIFEST [--output PATH]
 ```
 
 - `MANIFEST`：UTF-8 编码的 JSON 清单文件路径；`-` 表示从标准输入读取。命令不创建结果文件，也不修改清单或任务输入。
@@ -115,7 +115,7 @@ quantum-circuit-simulator batch-simulate MANIFEST
 ### reconcile 子命令
 
 ```bash
-quantum-circuit-simulator reconcile MANIFEST BASELINE
+quantum-circuit-simulator reconcile MANIFEST BASELINE [--output PATH]
 ```
 
 - `MANIFEST`：与 `batch-simulate` 完全相同的 UTF-8 JSON 清单（格式、字段、默认值、相对路径基准与任务隔离语义一致）；`-` 表示从标准输入读取。
@@ -143,7 +143,7 @@ quantum-circuit-simulator reconcile MANIFEST BASELINE
 ### equivalent 子命令
 
 ```bash
-quantum-circuit-simulator equivalent LEFT RIGHT
+quantum-circuit-simulator equivalent LEFT RIGHT [--output PATH]
 ```
 
 - `LEFT`、`RIGHT`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取，但两侧不能同时为 `-`（此时不读取标准输入）。
@@ -176,7 +176,7 @@ quantum-circuit-simulator equivalent LEFT RIGHT
 ### state-metrics 子命令
 
 ```bash
-quantum-circuit-simulator state-metrics LEFT RIGHT
+quantum-circuit-simulator state-metrics LEFT RIGHT [--output PATH]
 ```
 
 - `LEFT`、`RIGHT`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取，但两侧不能同时为 `-`（此时不读取标准输入）。
@@ -198,7 +198,7 @@ quantum-circuit-simulator state-metrics LEFT RIGHT
 ### optimize 子命令
 
 ```bash
-quantum-circuit-simulator optimize SOURCE
+quantum-circuit-simulator optimize SOURCE [--output PATH]
 ```
 
 - `SOURCE`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取。
@@ -221,7 +221,7 @@ quantum-circuit-simulator optimize SOURCE
 ### estimate 子命令
 
 ```bash
-quantum-circuit-simulator estimate SOURCE [--mode state-vector|density-matrix|unitary]
+quantum-circuit-simulator estimate SOURCE [--mode state-vector|density-matrix|unitary] [--output PATH]
 ```
 
 - `SOURCE`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取。
@@ -265,6 +265,24 @@ measure q[i] -> c[k];
 - `rx`、`ry`、`rz` 与受控旋转门 `crx`、`cry`、`crz` 恰好接收一个以弧度表示的角参数；`cz` 在控制位与目标位都为 1 时引入负相位，受控旋转仅在控制位为 1 时对目标位施加对应旋转；控制位与目标位相同属于语义错误；角表达式支持十进制整数、实数（含科学计数法）、常量 `pi`、圆括号、一元 `+`/`-` 以及二元 `+`、`-`、`*`、`/`（乘除优先于加减，同级从左到右，括号优先）。
 - 测量只能出现在所有量子门之后，每个量子位、经典位最多参与一次测量。
 
+### 结果导出（`--output PATH`）
+
+`simulate`、`probabilities`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 八个子命令均支持可选的 `--output PATH`，用于把结果直接导出到文件，调用方无需再重定向标准输出。
+
+- 省略该选项时，stdout、stderr、退出码及字节内容与既有行为完全一致。
+- 提供普通文件路径时，命令在结果可产出后，把原本应写入 stdout 的完整 UTF-8 JSON 行连同末尾换行写入该文件；此情况下 stdout 保持为空。文件字节内容与未指定 `--output` 时的 stdout 完全相同，因此 JSON 字段、字段顺序、数值规范、随机种子、噪声顺序、任务隔离与规模限制均不改变；同一输入导出到不同可写路径的内容完全一致。
+- 相对路径以当前工作目录为基准（不以清单或源文件所在目录为基准）；父目录必须已存在。目标可以是新文件或已有普通文件；覆盖已有文件时原子替换，并保留原文件权限。`PATH` 不能是 `-`，也不能是目录。
+- 导出覆盖正常退出码为 0 的结果，也覆盖 `batch-simulate` 含任务级失败、`reconcile` 发现差异时仍产出的完整报告：这两种情况成功写出后继续返回既有退出码 3，文件内容与不使用 `--output` 时的 stdout 字节一致。
+- 除路径冲突外，命令先按原规则完成参数、输入、解析、验证与计算；任何既有失败都不会创建、截断或替换目标文件。只有在报告已经生成后才尝试提交导出。
+- 为避免一次导出破坏可复现输入，目标路径经绝对化和规范化后，不得与本次命令读取的任何非标准输入文件相同。受保护的输入包括：
+  - 直接线路（`simulate`/`probabilities`/`optimize`/`estimate` 的 `SOURCE`，`equivalent`/`state-metrics` 的 `LEFT`、`RIGHT`）；
+  - 直接噪声模型（`--noise-model`）；
+  - 批量清单与 `reconcile` 基线；
+  - 有效清单内引用的线路与噪声模型（即使该文件当前缺失或不可读，路径仍受保护）。
+- 路径冲突在任何仿真或重跑任务执行之前检出：不运行仿真、不重跑任务、不修改文件，stderr 输出单行 `{"error":"output_error",...}`，退出码为 2。
+- 若父目录不存在、目标类型不合法、权限不足或写入/替换失败，stdout 为空，stderr 输出单行 `{"error":"output_error","message":"..."}`，退出码为 1；写入采用同目录临时文件 + 原子替换，失败时已有目标内容保持不变，也不会遗留可见的半成品文件。
+- `version` 与帮助行为不受该选项影响。
+
 ### 退出码与错误输出
 
 失败时 stdout 为空，stderr 输出单行 JSON：
@@ -299,6 +317,8 @@ measure q[i] -> c[k];
 | `estimate` 词法/语法或语义错误（带源码位置） | 2 | `parse_error` / `validation_error` |
 | `estimate` 非法 `--mode`（不读取 SOURCE） | 2 | 参数用法错误 |
 | `--shots`/`--seed` 等命令行参数错误（不读取输入） | 2 | 参数用法错误 |
+| `--output PATH` 父目录不存在、PATH 为 `-` 或目录、权限不足、写入或替换失败（stdout 为空；已有目标内容不变，不留半成品文件） | 1 | `output_error` |
+| `--output PATH` 与本次读取的任一非标准输入文件（线路、噪声模型、批量清单、对账基线或清单引用文件）绝对规范化后相同（不运行仿真或重跑任务，不修改文件） | 2 | `output_error` |
 
 ## 现有公开接口
 
