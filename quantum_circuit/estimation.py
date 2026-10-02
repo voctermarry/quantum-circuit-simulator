@@ -10,8 +10,14 @@ from __future__ import annotations
 
 from .openqasm import Program
 
-# Gates reported in ``gate_counts``, in the fixed output order.
-_GATE_ORDER = ("x", "h", "cx", "rx", "ry", "rz")
+# Gates reported in ``gate_counts``, in the fixed output order. The
+# schema_version 1 payload (circuits using only the original gate set) keeps
+# the historical six-entry mapping byte-identical; as soon as any of the
+# controlled gates ``cz``/``crx``/``cry``/``crz`` appears the payload becomes
+# schema_version 2 with all ten entries in this fixed order.
+_GATE_ORDER_V1 = ("x", "h", "cx", "rx", "ry", "rz")
+_GATE_ORDER_V2 = ("x", "h", "cx", "cz", "rx", "ry", "rz", "crx", "cry", "crz")
+_V2_GATES = frozenset(_GATE_ORDER_V2) - frozenset(_GATE_ORDER_V1)
 
 # One complex amplitude/matrix element payload: two doubles (real, imag).
 _COMPLEX_BYTES = 16
@@ -45,7 +51,11 @@ def estimate(program: Program, mode: str) -> dict[str, object]:
     """Return the deterministic estimate payload for *program* and *mode*."""
     base, qubit_limit = _MODE_TABLE[mode]
 
-    gate_counts = {name: 0 for name in _GATE_ORDER}
+    schema_version = (
+        2 if any(op.kind in _V2_GATES for op in program.operations) else 1
+    )
+    gate_order = _GATE_ORDER_V2 if schema_version == 2 else _GATE_ORDER_V1
+    gate_counts = {name: 0 for name in gate_order}
     gate_count = 0
     measurement_count = 0
     for op in program.operations:
@@ -57,7 +67,7 @@ def estimate(program: Program, mode: str) -> dict[str, object]:
 
     entry_count = base**program.num_qubits
     result = {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "mode": mode,
         "num_qubits": program.num_qubits,
         "num_clbits": program.num_clbits,

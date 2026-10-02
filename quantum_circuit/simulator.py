@@ -42,6 +42,41 @@ def _controlled_x(state: list[complex], control: int, target: int, num_qubits: i
                 state[index], state[other] = state[other], state[index]
 
 
+def _controlled_single(
+    state: list[complex],
+    control: int,
+    target: int,
+    num_qubits: int,
+    matrix: tuple[complex, complex, complex, complex],
+) -> None:
+    """Apply a single-qubit matrix to *target* where the *control* bit is 1."""
+    g00, g01, g10, g11 = matrix
+    cbit = 1 << control
+    tbit = 1 << target
+    step = tbit << 1
+    for base in range(0, 1 << num_qubits, step):
+        for low in range(base, base + tbit):
+            if not (low & cbit):
+                continue
+            high = low | tbit
+            a = state[low]
+            b = state[high]
+            state[low] = g00 * a + g01 * b
+            state[high] = g10 * a + g11 * b
+
+
+def _rotation_matrix(kind: str, theta: float) -> tuple[complex, complex, complex, complex]:
+    """The single-qubit matrix of an rx/ry/rz rotation by *theta* radians."""
+    c = math.cos(theta / 2)
+    s = math.sin(theta / 2)
+    if kind == "rx":
+        return (c, -1j * s, -1j * s, c)
+    if kind == "ry":
+        return (c, -s, s, c)
+    # rz
+    return (cmath.exp(-0.5j * theta), 0j, 0j, cmath.exp(0.5j * theta))
+
+
 def _rx(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None:
     c = math.cos(theta / 2)
     s = math.sin(theta / 2)
@@ -89,12 +124,19 @@ def _apply_gate(state: list[complex], op: Operation, num_qubits: int) -> None:
         _hadamard(state, op.targets[0], num_qubits)
     elif op.kind == "cx":
         _controlled_x(state, op.targets[0], op.targets[1], num_qubits)
+    elif op.kind == "cz":
+        _controlled_single(
+            state, op.targets[0], op.targets[1], num_qubits, (1 + 0j, 0j, 0j, -1 + 0j)
+        )
     elif op.kind == "rx":
         _rx(state, op.targets[0], num_qubits, op.params[0])
     elif op.kind == "ry":
         _ry(state, op.targets[0], num_qubits, op.params[0])
     elif op.kind == "rz":
         _rz(state, op.targets[0], num_qubits, op.params[0])
+    elif op.kind in ("crx", "cry", "crz"):
+        matrix = _rotation_matrix(op.kind[1:], op.params[0])
+        _controlled_single(state, op.targets[0], op.targets[1], num_qubits, matrix)
 
 
 def simulate_state_vector(program: Program) -> list[complex]:

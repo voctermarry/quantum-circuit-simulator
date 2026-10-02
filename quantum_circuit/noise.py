@@ -11,8 +11,9 @@ up to four channel keys (probabilities in ``[0, 1]``):
   the maximally mixed state with probability ``p``).
 
 After every quantum gate, each configured channel is applied to every qubit
-the gate touched. Qubits of a ``cx`` are processed in ascending index order;
-channels on one qubit are applied in :data:`CHANNEL_ORDER` order.
+the gate touched. Qubits of a two-qubit gate (``cx``, ``cz``, ``crx``,
+``cry``, ``crz``) are processed in ascending index order; channels on one
+qubit are applied in :data:`CHANNEL_ORDER` order.
 """
 
 from __future__ import annotations
@@ -144,6 +145,44 @@ def _apply_cx(rho: list[list[complex]], control: int, target: int, size: int) ->
             row[i], row[j] = row[j], row[i]
 
 
+def _apply_controlled(
+    rho: list[list[complex]], control: int, target: int, size: int, matrix
+) -> None:
+    """Apply ``rho -> U rho U†`` for a controlled single-qubit unitary.
+
+    ``U`` acts as the single-qubit *matrix* on *target* when the *control*
+    bit is 1 and as the identity otherwise. Done as a left pass (rows whose
+    control bit is set) followed by a right pass (columns whose control bit
+    is set), which also covers the cross blocks between the two sectors.
+    """
+    cbit = 1 << control
+    tbit = 1 << target
+    g00, g01, g10, g11 = matrix
+    h00, h01 = g00.conjugate(), g01.conjugate()
+    h10, h11 = g10.conjugate(), g11.conjugate()
+    for i0 in _basis_offsets(size, tbit):
+        if not (i0 & cbit):
+            continue
+        i1 = i0 | tbit
+        row0 = rho[i0]
+        row1 = rho[i1]
+        for j in range(size):
+            m0 = row0[j]
+            m1 = row1[j]
+            row0[j] = g00 * m0 + g01 * m1
+            row1[j] = g10 * m0 + g11 * m1
+    for j0 in _basis_offsets(size, tbit):
+        if not (j0 & cbit):
+            continue
+        j1 = j0 | tbit
+        for i in range(size):
+            row = rho[i]
+            m0 = row[j0]
+            m1 = row[j1]
+            row[j0] = m0 * h00 + m1 * h01
+            row[j1] = m0 * h10 + m1 * h11
+
+
 def _amplitude_damping(rho: list[list[complex]], qubit: int, size: int, gamma: float) -> None:
     bit = 1 << qubit
     scale = math.sqrt(1.0 - gamma)
@@ -238,6 +277,13 @@ def simulate_density_matrix(program: Program, noise: dict[str, float]) -> list[f
             continue
         if op.kind == "cx":
             _apply_cx(rho, op.targets[0], op.targets[1], size)
+        elif op.kind == "cz":
+            _apply_controlled(
+                rho, op.targets[0], op.targets[1], size, (1 + 0j, 0j, 0j, -1 + 0j)
+            )
+        elif op.kind in ("crx", "cry", "crz"):
+            matrix = _gate_matrix(op.kind[1:], op.params)
+            _apply_controlled(rho, op.targets[0], op.targets[1], size, matrix)
         else:
             _apply_single_qubit(rho, op.targets[0], size, _gate_matrix(op.kind, op.params))
         for qubit in sorted(set(op.targets)):
