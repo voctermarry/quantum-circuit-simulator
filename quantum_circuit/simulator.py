@@ -143,6 +143,35 @@ def unitary_matrix(program: Program) -> list[list[complex]]:
     return [[columns[col][row] for col in range(dim)] for row in range(dim)]
 
 
+def measurement_probabilities(program: Program, basis_probabilities: list[float]) -> dict[str, float]:
+    """Aggregate basis-state probabilities into classical-outcome probabilities.
+
+    Uses the same qubit-to-clbit mapping as :func:`sample_counts` (each
+    measured qubit contributes its bit to the classical index; unwritten
+    clbits stay 0) and the same fixed-width, lexicographically ordered key
+    convention. With no measurements the only possible outcome is the
+    all-zero string, carrying total probability 1.
+    """
+    width = program.num_clbits
+    measurements = [(op.targets[0], op.targets[1]) for op in program.operations if op.kind == "measure"]
+
+    if not measurements:
+        return {format(0, f"0{width}b") if width else "": 1.0}
+
+    aggregated: dict[int, float] = {}
+    for basis, probability in enumerate(basis_probabilities):
+        classical = 0
+        for qubit, clbit in measurements:
+            if (basis >> qubit) & 1:
+                classical |= 1 << clbit
+        aggregated[classical] = aggregated.get(classical, 0.0) + probability
+
+    return {
+        format(classical, f"0{width}b") if width else "": probability
+        for classical, probability in sorted(aggregated.items())
+    }
+
+
 def sample_counts(program: Program, state: list[complex], shots: int, seed: int) -> dict[str, int]:
     """Draw *shots* samples from *state* deterministically from *seed*.
 

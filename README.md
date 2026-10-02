@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、按清单批量执行独立仿真的 `batch-simulate` 入口、按清单重跑并与历史批量结果对账的 `reconcile` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、输出末态精确测量概率（不采样）的 `probabilities` 入口、按清单批量执行独立仿真的 `batch-simulate` 入口、按清单重跑并与历史批量结果对账的 `reconcile` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
 
 ## 环境与安装
 
@@ -26,6 +26,7 @@ python -m pytest
 quantum-circuit-simulator version                # 打印版本号
 quantum-circuit-simulator --help                 # 打印用法
 quantum-circuit-simulator simulate circuit.qasm  # 仿真并采样
+quantum-circuit-simulator probabilities circuit.qasm  # 输出末态精确测量概率
 quantum-circuit-simulator batch-simulate jobs.json  # 按清单批量仿真
 quantum-circuit-simulator reconcile jobs.json baseline.json  # 重跑清单并与历史结果对账
 quantum-circuit-simulator equivalent a.qasm b.qasm  # 判断两份线路是否同一变换
@@ -65,6 +66,27 @@ quantum-circuit-simulator simulate SOURCE [--shots N] [--seed S] [--noise-model 
 每个量子门完成后，对该门涉及的量子位施加配置的通道；`cx` 的两位按下标升序处理，同一位固定按 `amplitude_damping`、`phase_damping`、`bit_flip`、`depolarizing` 的顺序处理。采样取最终密度矩阵的对角概率，噪声演化不消耗 seed。
 
 成功输出字段顺序为 `schema_version`、`shots`、`seed`、`num_qubits`、`num_clbits`、`noise_model`、`counts`，其中 `schema_version` 为 2；`noise_model` 按固定通道顺序仅回显已给概率，模型的空白与键顺序不影响输出。
+
+### probabilities 子命令
+
+```bash
+quantum-circuit-simulator probabilities SOURCE [--noise-model PATH]
+```
+
+- `SOURCE` 与 `--noise-model` 的文件、UTF-8、标准输入（`-`）与相对路径语义完全沿用 `simulate`；两者不能同时为 `-`（违反时不读取标准输入）。命令不接受 `--shots` 或 `--seed`，不进行采样，因此输出不包含随机性。
+- 无 `--noise-model` 时沿用 `simulate` 的状态向量语义，最多 20 个量子位；提供模型时沿用既有通道顺序与密度矩阵语义，最多 10 个量子位。
+
+成功时 stdout 仅输出一行确定性 JSON。无噪声字段顺序为 `schema_version`、`num_qubits`、`num_clbits`、`probabilities`，其中 `schema_version` 为 1：
+
+```json
+{"schema_version": 1, "num_qubits": 2, "num_clbits": 2, "probabilities": {"00": 0.5000000000000001, "11": 0.5000000000000001}}
+```
+
+- 带噪声时字段顺序为 `schema_version`、`num_qubits`、`num_clbits`、`noise_model`、`probabilities`，其中 `schema_version` 为 2；`noise_model` 在 `num_clbits` 之后按固定通道顺序回显已给概率。
+- `probabilities` 的键沿用 `simulate` 的 `counts` 键约定（经典寄存器最高下标到最低下标的定宽二进制串），并按字典序排列；基矢概率按测量映射聚合，未写入的经典位为 0。没有任何测量时只输出概率为 1 的全零串。
+- 绝对值不超过 `1e-15` 的项省略不写；与 1 的差不超过 `1e-15` 的项写为 `1`；其余项为 0 到 1 之间的有限 JSON 数字，所有输出项之和与 1 的误差不超过 `1e-12`，不会出现 NaN、Infinity 或负零。
+- 错误语义、错误名称与退出码沿用 `simulate`（源文件 `io_error` 为 1；`parse_error`、`validation_error`、`noise_model_error` 为 2；带噪声线路超过 10 个量子位的 `simulation_error` 为 3；参数错误为退出码 2 的用法错误），失败时 stdout 为空。
+- 相同输入重复执行产生字节一致的 stdout。
 
 ### batch-simulate 子命令
 
@@ -250,6 +272,8 @@ measure q[i] -> c[k];
 | 重复声明、寄存器越界或大小非法、名称未声明、重复测量、测量后仍有量子门、角表达式中出现 `pi` 以外的名称、除以零、数值字面量溢出或结果非有限数等（带源码位置） | 2 | `validation_error` |
 | 噪声模型内容不合规（非法 UTF-8/JSON、非对象、空对象、未知键、重复键、概率非 0 到 1 的有限数字）或线路与模型同时取 `-`（此时不读取标准输入） | 2 | `noise_model_error` |
 | 带噪声线路超过 10 个量子位 | 3 | `simulation_error` |
+| `probabilities` 的源文件/噪声模型读取、词法语法、语义及噪声模型错误，以及线路与模型同时取 `-` | 与 `simulate` 相同：`io_error` 1、`parse_error`/`validation_error`/`noise_model_error` 2、带噪声超 10 量子位的 `simulation_error` 3（失败时 stdout 为空） |
+| `probabilities` 传入 `--shots`/`--seed` 等不支持的参数 | 2 | 参数用法错误 |
 | `batch-simulate` 清单文件不存在、不可读或不是合法 UTF-8 | 1 | `io_error` |
 | `batch-simulate` 清单 JSON 语法错误，或结构/类型/数值不合规（未知或重复键、字段缺失、`id` 为空或重复、`jobs` 数量越界、`shots` 非正整数、`seed` 非整数、路径为 `-` 等；此时不读取任何任务文件） | 2 | `batch_input_error` |
 | `batch-simulate` 存在任务级失败（清单本身有效；汇总 JSON 仍写入 stdout，错误嵌入对应结果） | 3 | 结果内为 `io_error` / `parse_error` / `validation_error` / `noise_model_error` / `simulation_error` |
@@ -273,7 +297,7 @@ measure q[i] -> c[k];
 
 ## 现有公开接口
 
-- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
+- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`probabilities`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
 - Python 包 `quantum_circuit`，其 `__version__` 为当前版本号
 
 ## 限制

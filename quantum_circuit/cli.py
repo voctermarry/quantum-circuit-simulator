@@ -23,9 +23,15 @@ from .noise import (
     parse_noise_model,
     simulate_density_matrix,
 )
-from .openqasm import ParseError, ValidationError, parse
+from .openqasm import ParseError, Program, ValidationError, parse
 from .optimizer import optimize as optimize_program
-from .simulator import sample_counts, sample_counts_from_probabilities, simulate_state_vector, unitary_matrix
+from .simulator import (
+    measurement_probabilities,
+    sample_counts,
+    sample_counts_from_probabilities,
+    simulate_state_vector,
+    unitary_matrix,
+)
 
 
 def _positive_int(value: str) -> int:
@@ -69,24 +75,28 @@ def _emit_error_payload(payload: dict[str, object]) -> None:
     sys.stderr.write(json.dumps(payload) + "\n")
 
 
-def _run_simulation(
+def _prepare_simulation(
     source_arg: str,
-    shots: int,
-    seed: int,
     noise_model_arg: str | None,
     base_dir: str | None = None,
-) -> tuple[dict[str, object] | None, dict[str, object] | None, int]:
-    """Run one simulation with the exact semantics of ``simulate``.
+) -> tuple[Program | None, dict[str, float] | None, dict[str, object] | None, int]:
+    """Read, decode, parse and validate one simulation input.
 
-    Returns ``(output, error, exit_code)``: on success *error* is ``None``
-    and *output* is the payload printed by ``simulate``; on failure *output*
-    is ``None`` and *error* is the payload ``simulate`` would write to
-    stderr (including line/column where applicable).
+    Returns ``(program, noise_model, error, exit_code)``: on success *error*
+    is ``None`` and *program* is the parsed circuit (with *noise_model*
+    ``None`` on the state-vector path); on failure *program* is ``None`` and
+    *error* is the payload the calling command writes to stderr (including
+    line/column where applicable).
+
+    Reading (files, UTF-8, ``-`` for stdin, relative paths) and error
+    semantics match ``simulate`` for both ``simulate`` and
+    ``probabilities``. No qubit-limit or simulation error is raised here;
+    callers apply their own limits.
 
     When *base_dir* is given (the batch case), relative paths are opened
     relative to it while error messages keep quoting *source_arg* and
-    *noise_model_arg* verbatim, so messages match a standalone ``simulate``
-    invocation with the same path strings.
+    *noise_model_arg* verbatim, so messages match a standalone invocation
+    with the same path strings.
     """
 
     def open_path(path: str) -> str:
@@ -96,6 +106,7 @@ def _run_simulation(
 
     if noise_model_arg is not None and source_arg == "-" and noise_model_arg == "-":
         return (
+            None,
             None,
             _error_payload(
                 "noise_model_error",
@@ -111,12 +122,16 @@ def _run_simulation(
             with open(open_path(source_arg), "rb") as handle:
                 data = handle.read()
     except OSError as exc:
-        return None, _error_payload("io_error", f"cannot read source {source_arg!r}: {exc.strerror or exc}"), 1
+        return None, None, _error_payload(
+            "io_error", f"cannot read source {source_arg!r}: {exc.strerror or exc}"
+        ), 1
 
     try:
         source = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        return None, _error_payload("io_error", f"source {source_arg!r} is not valid UTF-8: {exc}"), 1
+        return None, None, _error_payload(
+            "io_error", f"source {source_arg!r} is not valid UTF-8: {exc}"
+        ), 1
 
     noise_model: dict[str, float] | None = None
     if noise_model_arg is not None:
@@ -129,6 +144,7 @@ def _run_simulation(
         except OSError as exc:
             return (
                 None,
+                None,
                 _error_payload(
                     "io_error", f"cannot read noise model {noise_model_arg!r}: {exc.strerror or exc}"
                 ),
@@ -139,6 +155,7 @@ def _run_simulation(
         except UnicodeDecodeError as exc:
             return (
                 None,
+                None,
                 _error_payload(
                     "noise_model_error",
                     f"noise model {noise_model_arg!r} is not valid UTF-8: {exc}",
@@ -148,14 +165,36 @@ def _run_simulation(
         try:
             noise_model = parse_noise_model(model_text)
         except NoiseModelError as exc:
-            return None, _error_payload("noise_model_error", str(exc)), 2
+            return None, None, _error_payload("noise_model_error", str(exc)), 2
 
     try:
         program = parse(source)
     except ParseError as exc:
-        return None, _error_payload("parse_error", exc.message, exc.line, exc.column), 2
+        return None, None, _error_payload("parse_error", exc.message, exc.line, exc.column), 2
     except ValidationError as exc:
-        return None, _error_payload("validation_error", exc.message, exc.line, exc.column), 2
+        return None, None, _error_payload("validation_error", exc.message, exc.line, exc.column), 2
+
+    return program, noise_model, None, 0
+
+
+def _run_simulation(
+    source_arg: str,
+    shots: int,
+    seed: int,
+    noise_model_arg: str | None,
+    base_dir: str | None = None,
+) -> tuple[dict[str, object] | None, dict[str, object] | None, int]:
+    """Run one simulation with the exact semantics of ``simulate``.
+
+    Returns ``(output, error, exit_code)``: on success *error* is ``None``
+    and *output* is the payload printed by ``simulate``; on failure *output*
+    is ``None`` and *error* is the payload ``simulate`` would write to
+    stderr (including line/column where applicable).
+    """
+    program, noise_model, error, exit_code = _prepare_simulation(source_arg, noise_model_arg, base_dir)
+    if error is not None:
+        return None, error, exit_code
+    assert program is not None
 
     if noise_model is None:
         state = simulate_state_vector(program)
@@ -198,6 +237,94 @@ def _simulate(source_arg: str, shots: int, seed: int, noise_model_arg: str | Non
     if error is not None:
         _emit_error_payload(error)
         return exit_code
+    sys.stdout.write(json.dumps(result) + "\n")
+    return 0
+
+
+# --------------------------------------------------------------- probabilities
+
+# Probabilities are reported in full; entries this close to 0 are omitted
+# and entries this close to 1 are reported as exactly 1. Reported values
+# sum to within 1e-12 of 1.
+_PROBABILITY_ZERO_TOLERANCE = 1e-15
+_PROBABILITY_ONE_TOLERANCE = 1e-15
+
+
+def _snap_probability(value: float) -> float | None:
+    """Snap one probability for deterministic output.
+
+    Returns ``None`` when the entry is omitted (magnitude at most
+    ``1e-15``), ``1.0`` when it is within ``1e-15`` of 1, and otherwise a
+    finite ``float`` clamped to ``(0, 1)`` so simulation round-off can
+    never produce an out-of-range value.
+    """
+    if abs(value) <= _PROBABILITY_ZERO_TOLERANCE:
+        return None
+    if abs(1.0 - value) <= _PROBABILITY_ONE_TOLERANCE:
+        return 1.0
+    return min(1.0, max(0.0, float(value)))
+
+
+def _probability_payload(
+    program: Program,
+    basis_probabilities: list[float],
+    noise_model: dict[str, float] | None,
+) -> dict[str, object]:
+    """Build the deterministic ``probabilities`` success payload.
+
+    The aggregated classical distribution is renormalized by its total
+    first, mirroring the normalization the sampling path applies to basis
+    probabilities, so simulation round-off (notably density-matrix drift)
+    cannot move the reported sum away from 1.
+    """
+    aggregated = measurement_probabilities(program, basis_probabilities)
+    total = math.fsum(aggregated.values())
+    probabilities: dict[str, float] = {}
+    for key, value in aggregated.items():
+        normalized = value / total if total else value
+        snapped = _snap_probability(normalized)
+        if snapped is not None:
+            probabilities[key] = snapped
+
+    if noise_model is None:
+        return {
+            "schema_version": 1,
+            "num_qubits": program.num_qubits,
+            "num_clbits": program.num_clbits,
+            "probabilities": probabilities,
+        }
+    return {
+        "schema_version": 2,
+        "num_qubits": program.num_qubits,
+        "num_clbits": program.num_clbits,
+        "noise_model": noise_model,
+        "probabilities": probabilities,
+    }
+
+
+def _probabilities(source_arg: str, noise_model_arg: str | None) -> int:
+    program, noise_model, error, exit_code = _prepare_simulation(source_arg, noise_model_arg)
+    if error is not None:
+        _emit_error_payload(error)
+        return exit_code
+    assert program is not None
+
+    if noise_model is None:
+        # Register sizes are already capped at 20 by the parser, matching
+        # the state-vector limit enforced for ``simulate``.
+        state = simulate_state_vector(program)
+        basis_probabilities = [abs(amplitude) ** 2 for amplitude in state]
+    else:
+        if program.num_qubits > MAX_NOISE_QUBITS:
+            _emit_error(
+                "simulation_error",
+                f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
+                f"got {program.num_qubits}",
+            )
+            return 3
+        basis_probabilities = simulate_density_matrix(program, noise_model)
+
+    result = _probability_payload(program, basis_probabilities, noise_model)
     sys.stdout.write(json.dumps(result) + "\n")
     return 0
 
@@ -1043,6 +1170,20 @@ def main(argv: list[str] | None = None) -> int:
         help="optional JSON noise model for density-matrix simulation ('-' reads stdin)",
     )
 
+    probabilities_parser = sub.add_parser(
+        "probabilities",
+        help="report exact final-state measurement probabilities without sampling",
+    )
+    probabilities_parser.add_argument(
+        "source", help="path to the OpenQASM source file, or '-' for stdin"
+    )
+    probabilities_parser.add_argument(
+        "--noise-model",
+        metavar="PATH",
+        default=None,
+        help="optional JSON noise model for density-matrix probabilities ('-' reads stdin)",
+    )
+
     equivalent_parser = sub.add_parser(
         "equivalent",
         help="check whether two noiseless OpenQASM circuits implement the same transformation",
@@ -1105,6 +1246,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "simulate":
         return _simulate(args.source, args.shots, args.seed, args.noise_model)
+
+    if args.command == "probabilities":
+        return _probabilities(args.source, args.noise_model)
 
     if args.command == "batch-simulate":
         return _batch_simulate(args.manifest)
