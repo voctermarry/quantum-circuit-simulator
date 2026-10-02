@@ -42,6 +42,62 @@ def _controlled_x(state: list[complex], control: int, target: int, num_qubits: i
                 state[index], state[other] = state[other], state[index]
 
 
+def _controlled_z(state: list[complex], control: int, target: int, num_qubits: int) -> None:
+    bits = (1 << control) | (1 << target)
+    for index in range(1 << num_qubits):
+        if (index & bits) == bits:
+            state[index] = -state[index]
+
+
+def _controlled_rx(
+    state: list[complex], control: int, target: int, num_qubits: int, theta: float
+) -> None:
+    c = math.cos(theta / 2)
+    s = math.sin(theta / 2)
+    cbit = 1 << control
+    tbit = 1 << target
+    for index in range(1 << num_qubits):
+        if (index & cbit) and not (index & tbit):
+            high = index | tbit
+            if index < high:
+                a = state[index]
+                b = state[high]
+                state[index] = c * a - 1j * s * b
+                state[high] = -1j * s * a + c * b
+
+
+def _controlled_ry(
+    state: list[complex], control: int, target: int, num_qubits: int, theta: float
+) -> None:
+    c = math.cos(theta / 2)
+    s = math.sin(theta / 2)
+    cbit = 1 << control
+    tbit = 1 << target
+    for index in range(1 << num_qubits):
+        if (index & cbit) and not (index & tbit):
+            high = index | tbit
+            if index < high:
+                a = state[index]
+                b = state[high]
+                state[index] = c * a - s * b
+                state[high] = s * a + c * b
+
+
+def _controlled_rz(
+    state: list[complex], control: int, target: int, num_qubits: int, theta: float
+) -> None:
+    lo_factor = cmath.exp(-0.5j * theta)
+    hi_factor = cmath.exp(0.5j * theta)
+    cbit = 1 << control
+    tbit = 1 << target
+    for index in range(1 << num_qubits):
+        if index & cbit:
+            if index & tbit:
+                state[index] = hi_factor * state[index]
+            else:
+                state[index] = lo_factor * state[index]
+
+
 def _rx(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None:
     c = math.cos(theta / 2)
     s = math.sin(theta / 2)
@@ -89,12 +145,20 @@ def _apply_gate(state: list[complex], op: Operation, num_qubits: int) -> None:
         _hadamard(state, op.targets[0], num_qubits)
     elif op.kind == "cx":
         _controlled_x(state, op.targets[0], op.targets[1], num_qubits)
+    elif op.kind == "cz":
+        _controlled_z(state, op.targets[0], op.targets[1], num_qubits)
     elif op.kind == "rx":
         _rx(state, op.targets[0], num_qubits, op.params[0])
     elif op.kind == "ry":
         _ry(state, op.targets[0], num_qubits, op.params[0])
     elif op.kind == "rz":
         _rz(state, op.targets[0], num_qubits, op.params[0])
+    elif op.kind == "crx":
+        _controlled_rx(state, op.targets[0], op.targets[1], num_qubits, op.params[0])
+    elif op.kind == "cry":
+        _controlled_ry(state, op.targets[0], op.targets[1], num_qubits, op.params[0])
+    elif op.kind == "crz":
+        _controlled_rz(state, op.targets[0], op.targets[1], num_qubits, op.params[0])
 
 
 def simulate_state_vector(program: Program) -> list[complex]:

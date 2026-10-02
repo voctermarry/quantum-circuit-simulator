@@ -4,11 +4,12 @@ The optimizer rewrites the pre-measurement gate sequence into a canonical
 form while preserving the circuit's transformation up to a global phase and
 keeping the measurement layout (qubit-to-clbit mapping) intact:
 
-* adjacent ``x``/``x``, ``h``/``h`` pairs and ``cx`` pairs with identical
-  control and target cancel ("adjacent" allows intervening gates on
-  disjoint qubits);
-* consecutive same-axis ``rx``/``ry``/``rz`` rotations on one qubit merge
-  into a single rotation;
+* adjacent ``x``/``x``, ``h``/``h`` pairs, ``cx`` pairs and ``cz`` pairs
+  with identical control and target cancel ("adjacent" allows intervening
+  gates on disjoint qubits);
+* consecutive same-axis ``rx``/``ry``/``rz`` rotations on one qubit, and
+  same-axis ``crx``/``cry``/``crz`` rotations with identical control and
+  target, merge into a single rotation;
 * rotations whose normalized angle has magnitude at most ``1e-12`` are
   deleted;
 * gates acting on disjoint qubits are moved past each other until the
@@ -17,8 +18,11 @@ keeping the measurement layout (qubit-to-clbit mapping) intact:
 
 Simplification passes repeat until the sequence reaches a fixed point, so
 inputs that differ only in the ordering of independent gates produce
-byte-identical output. Rotation angles are normalized to ``(-pi, pi]``
-(rendering a value at either boundary as ``pi`` when it is positive).
+byte-identical output. Single-qubit rotation angles are normalized to
+``(-pi, pi]`` (rendering a value at either boundary as ``pi`` when it is
+positive); controlled rotations are periodic in ``4*pi`` and normalize to
+``(-2*pi, 2*pi]`` (the boundary is written as ``2*pi`` rather than dropped
+as a global phase).
 """
 
 from __future__ import annotations
@@ -29,11 +33,12 @@ from dataclasses import dataclass
 
 from .openqasm import Operation, Program
 
-# Rotations this small (after normalization to (-pi, pi]) act as the
-# identity within floating-point precision and are removed.
+# Rotations this small (after normalization) act as the identity within
+# floating-point precision and are removed.
 _ANGLE_EPSILON = 1e-12
 
 _ROTATIONS = ("rx", "ry", "rz")
+_CONTROLLED_ROTATIONS = ("crx", "cry", "crz")
 
 
 @dataclass(frozen=True)
@@ -63,6 +68,23 @@ def normalize_angle(angle: float) -> float:
     return reduced
 
 
+def normalize_controlled_angle(angle: float) -> float:
+    """Reduce a controlled rotation *angle* modulo ``4*pi`` to ``(-2*pi, 2*pi]``.
+
+    A controlled rotation is not invariant under a ``2*pi`` shift (that
+    shift contributes a relative phase on the control), so the
+    single-qubit normalization must not be reused here. Values already
+    inside the interval are returned untouched.
+    """
+    period = 4.0 * math.pi
+    if -2.0 * math.pi < angle <= 2.0 * math.pi:
+        return angle
+    reduced = (angle + 2.0 * math.pi) % period - 2.0 * math.pi
+    if reduced == -2.0 * math.pi:
+        return 2.0 * math.pi
+    return reduced
+
+
 def _format_angle(angle: float) -> str:
     """Render a normalized angle deterministically.
 
@@ -77,10 +99,16 @@ def _format_angle(angle: float) -> str:
 
 
 def _gate_from_operation(op: Operation) -> Gate:
-    if op.kind == "cx":
-        return Gate("cx", (op.targets[0], op.targets[1]))
+    if op.kind in ("cx", "cz"):
+        return Gate(op.kind, (op.targets[0], op.targets[1]))
     if op.kind in _ROTATIONS:
         return Gate(op.kind, (op.targets[0],), normalize_angle(op.params[0]))
+    if op.kind in _CONTROLLED_ROTATIONS:
+        return Gate(
+            op.kind,
+            (op.targets[0], op.targets[1]),
+            normalize_controlled_angle(op.params[0]),
+        )
     return Gate(op.kind, (op.targets[0],))
 
 
@@ -97,29 +125,38 @@ def _cancels(first: Gate, second: Gate) -> bool:
         return False
     if first.kind in ("x", "h"):
         return first.kind == second.kind
-    if first.kind == "cx":
-        return second.kind == "cx"
+    if first.kind in ("cx", "cz"):
+        return second.kind == first.kind
     return False
 
 
 def _merge(first: Gate, second: Gate) -> Gate | None:
-    """Merge two same-axis rotations on the same qubit, if applicable.
+    """Merge two same-axis rotations sharing the same qubit(s), if applicable.
 
-    Returns the merged :class:`Gate`, or ``None`` when the gates cannot be
-    merged.
+    Single-qubit rotations merge on the same qubit; controlled rotations
+    additionally require identical control and target (enforced by equal
+    qubit tuples). Returns the merged :class:`Gate`, or ``None`` when the
+    gates cannot be merged.
     """
-    if (
-        first.kind in _ROTATIONS
-        and first.kind == second.kind
-        and first.qubits == second.qubits
-    ):
+    if first.kind != second.kind or first.qubits != second.qubits:
+        return None
+    if first.kind in _ROTATIONS:
         assert first.angle is not None and second.angle is not None
         return Gate(first.kind, first.qubits, normalize_angle(first.angle + second.angle))
+    if first.kind in _CONTROLLED_ROTATIONS:
+        assert first.angle is not None and second.angle is not None
+        return Gate(
+            first.kind,
+            first.qubits,
+            normalize_controlled_angle(first.angle + second.angle),
+        )
     return None
 
 
 def _is_identity_rotation(gate: Gate) -> bool:
-    return gate.kind in _ROTATIONS and gate.angle is not None and abs(gate.angle) <= _ANGLE_EPSILON
+    return (
+        gate.kind in _ROTATIONS or gate.kind in _CONTROLLED_ROTATIONS
+    ) and gate.angle is not None and abs(gate.angle) <= _ANGLE_EPSILON
 
 
 def _simplify_once(gates: list[Gate]) -> list[Gate] | None:
@@ -220,11 +257,17 @@ def canonical_gates(operations: tuple[Operation, ...]) -> tuple[tuple[Gate, ...]
 
 
 def _gate_line(gate: Gate) -> str:
-    if gate.kind == "cx":
-        return f"cx q[{gate.qubits[0]}],q[{gate.qubits[1]}];"
+    if gate.kind in ("cx", "cz"):
+        return f"{gate.kind} q[{gate.qubits[0]}],q[{gate.qubits[1]}];"
     if gate.kind in _ROTATIONS:
         assert gate.angle is not None
         return f"{gate.kind}({_format_angle(gate.angle)}) q[{gate.qubits[0]}];"
+    if gate.kind in _CONTROLLED_ROTATIONS:
+        assert gate.angle is not None
+        return (
+            f"{gate.kind}({_format_angle(gate.angle)}) "
+            f"q[{gate.qubits[0]}],q[{gate.qubits[1]}];"
+        )
     return f"{gate.kind} q[{gate.qubits[0]}];"
 
 

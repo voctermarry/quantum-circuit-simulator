@@ -9,9 +9,13 @@ Supported subset::
     x qubit;
     h qubit;
     cx qubit, qubit;
+    cz qubit, qubit;
     rx(angle) qubit;
     ry(angle) qubit;
     rz(angle) qubit;
+    crx(angle) qubit, qubit;
+    cry(angle) qubit, qubit;
+    crz(angle) qubit, qubit;
     measure qubit -> cbit;
 
 Only one ``qreg`` and one ``creg`` may be declared, and gates/measures only
@@ -60,8 +64,9 @@ class Token:
 
 
 _KEYWORDS = {"OPENQASM", "include", "qreg", "creg", "measure"}
-_BUILTIN_GATES = {"x", "h", "cx", "rx", "ry", "rz"}
+_BUILTIN_GATES = {"x", "h", "cx", "cz", "rx", "ry", "rz", "crx", "cry", "crz"}
 _PARAMETERIZED_GATES = {"rx", "ry", "rz"}
+_CONTROLLED_ROTATION_GATES = {"crx", "cry", "crz"}
 
 # A state vector has 2**n amplitudes; larger registers cannot be simulated
 # and are rejected as illegal sizes rather than crashing.
@@ -174,7 +179,7 @@ def tokenize(source: str) -> list[Token]:
 class Operation:
     """A validated gate application or measurement."""
 
-    kind: str  # 'x', 'h', 'cx', 'rx', 'ry', 'rz' or 'measure'
+    kind: str  # 'x', 'h', 'cx', 'cz', 'rx', 'ry', 'rz', 'crx', 'cry', 'crz' or 'measure'
     targets: tuple[int, ...]  # qubit indices; measure appends the cbit index
     params: tuple[float, ...] = ()  # gate angles in radians (rx/ry/rz only)
 
@@ -472,18 +477,40 @@ def parse(source: str) -> Program:
                     tok.column,
                 )
             advance()
-            if gate_name == "cx":
+            if gate_name in ("cx", "cz"):
                 ctrl, _, _ = parse_index("q")
                 expect(",")
                 tgt, tgt_name_tok, _ = parse_index("q")
                 expect(";")
                 if ctrl == tgt:
                     raise ValidationError(
-                        "cx control and target must be different qubits",
+                        f"{gate_name} control and target must be different qubits",
                         tgt_name_tok.line,
                         tgt_name_tok.column,
                     )
-                operations.append(Operation("cx", (ctrl, tgt)))
+                operations.append(Operation(gate_name, (ctrl, tgt)))
+            elif gate_name in _CONTROLLED_ROTATION_GATES:
+                expect("(")
+                angle = parse_angle()
+                if peek().kind == ",":
+                    comma = peek()
+                    raise ParseError(
+                        f"gate {gate_name!r} takes exactly one angle parameter",
+                        comma.line,
+                        comma.column,
+                    )
+                expect(")")
+                ctrl, _, _ = parse_index("q")
+                expect(",")
+                tgt, tgt_name_tok, _ = parse_index("q")
+                expect(";")
+                if ctrl == tgt:
+                    raise ValidationError(
+                        f"{gate_name} control and target must be different qubits",
+                        tgt_name_tok.line,
+                        tgt_name_tok.column,
+                    )
+                operations.append(Operation(gate_name, (ctrl, tgt), (angle,)))
             elif gate_name in _PARAMETERIZED_GATES:
                 expect("(")
                 angle = parse_angle()

@@ -11,8 +11,9 @@ up to four channel keys (probabilities in ``[0, 1]``):
   the maximally mixed state with probability ``p``).
 
 After every quantum gate, each configured channel is applied to every qubit
-the gate touched. Qubits of a ``cx`` are processed in ascending index order;
-channels on one qubit are applied in :data:`CHANNEL_ORDER` order.
+the gate touched. Qubits of a two-qubit gate (``cx``, ``cz`` and the
+controlled rotations) are processed in ascending index order; channels on
+one qubit are applied in :data:`CHANNEL_ORDER` order.
 """
 
 from __future__ import annotations
@@ -144,6 +145,79 @@ def _apply_cx(rho: list[list[complex]], control: int, target: int, size: int) ->
             row[i], row[j] = row[j], row[i]
 
 
+def _controlled_gate_matrix(
+    kind: str, params: tuple[float, ...]
+) -> tuple[complex, complex, complex, complex]:
+    """Target-qubit 2x2 matrix applied when the control qubit is 1.
+
+    Returned in the same ``(g00, g01, g10, g11)`` layout as
+    :func:`_gate_matrix`: ``cz`` acts as Pauli Z on the target, while the
+    controlled rotations reuse the corresponding single-qubit matrices.
+    """
+    if kind == "cz":
+        return (1 + 0j, 0j, 0j, -1 - 0j)
+    return _gate_matrix(kind[1:], params)
+
+
+def _apply_controlled_single_qubit(
+    rho: list[list[complex]], control: int, target: int, size: int, matrix
+) -> None:
+    """Apply ``rho -> U rho U†`` for a controlled single-qubit unitary.
+
+    The control=0 sectors are identity; the control=1, target sector is
+    transformed by the 2x2 *matrix* on both axes, generalizing
+    :func:`_apply_single_qubit` to the four (control, target) sectors.
+    """
+    cbit = 1 << control
+    tbit = 1 << target
+    g00, g01, g10, g11 = matrix
+    h00, h01 = g00.conjugate(), g01.conjugate()
+    h10, h11 = g10.conjugate(), g11.conjugate()
+
+    # Basis indices with both the control and target bits clear; adding the
+    # cbit/tbit combinations enumerates the four sectors (control, target).
+    rests = [i for i in range(size) if not (i & (cbit | tbit))]
+    for ri in rests:
+        i0, i1 = ri, ri | tbit
+        i2, i3 = ri | cbit, ri | cbit | tbit
+        row0 = rho[i0]
+        row1 = rho[i1]
+        row2 = rho[i2]
+        row3 = rho[i3]
+        for rj in rests:
+            j0, j1 = rj, rj | tbit
+            j2, j3 = rj | cbit, rj | cbit | tbit
+
+            m02, m03 = row0[j2], row0[j3]
+            m12, m13 = row1[j2], row1[j3]
+            m20, m21, m22, m23 = row2[j0], row2[j1], row2[j2], row2[j3]
+            m30, m31, m32, m33 = row3[j0], row3[j1], row3[j2], row3[j3]
+
+            # U on the left: control=0 rows unchanged, control=1 rows mixed.
+            t20 = g00 * m20 + g01 * m30
+            t21 = g00 * m21 + g01 * m31
+            t22 = g00 * m22 + g01 * m32
+            t23 = g00 * m23 + g01 * m33
+            t30 = g10 * m20 + g11 * m30
+            t31 = g10 * m21 + g11 * m31
+            t32 = g10 * m22 + g11 * m32
+            t33 = g10 * m23 + g11 * m33
+
+            # U† on the right: control=0 columns unchanged, control=1 mixed.
+            row0[j2] = m02 * h00 + m03 * h01
+            row0[j3] = m02 * h10 + m03 * h11
+            row1[j2] = m12 * h00 + m13 * h01
+            row1[j3] = m12 * h10 + m13 * h11
+            row2[j0] = t20
+            row2[j1] = t21
+            row2[j2] = t22 * h00 + t23 * h01
+            row2[j3] = t22 * h10 + t23 * h11
+            row3[j0] = t30
+            row3[j1] = t31
+            row3[j2] = t32 * h00 + t33 * h01
+            row3[j3] = t32 * h10 + t33 * h11
+
+
 def _amplitude_damping(rho: list[list[complex]], qubit: int, size: int, gamma: float) -> None:
     bit = 1 << qubit
     scale = math.sqrt(1.0 - gamma)
@@ -238,6 +312,14 @@ def simulate_density_matrix(program: Program, noise: dict[str, float]) -> list[f
             continue
         if op.kind == "cx":
             _apply_cx(rho, op.targets[0], op.targets[1], size)
+        elif op.kind in ("cz", "crx", "cry", "crz"):
+            _apply_controlled_single_qubit(
+                rho,
+                op.targets[0],
+                op.targets[1],
+                size,
+                _controlled_gate_matrix(op.kind, op.params),
+            )
         else:
             _apply_single_qubit(rho, op.targets[0], size, _gate_matrix(op.kind, op.params))
         for qubit in sorted(set(op.targets)):

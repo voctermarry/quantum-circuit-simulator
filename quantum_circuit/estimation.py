@@ -11,7 +11,11 @@ from __future__ import annotations
 from .openqasm import Program
 
 # Gates reported in ``gate_counts``, in the fixed output order.
-_GATE_ORDER = ("x", "h", "cx", "rx", "ry", "rz")
+_GATE_ORDER_V1 = ("x", "h", "cx", "rx", "ry", "rz")
+# The controlled-gate extension inserts ``cz`` after ``cx`` and appends the
+# controlled rotations; circuits using any new gate report all ten.
+_GATE_ORDER_V2 = ("x", "h", "cx", "cz", "rx", "ry", "rz", "crx", "cry", "crz")
+_EXTENDED_GATES = frozenset(("cz", "crx", "cry", "crz"))
 
 # One complex amplitude/matrix element payload: two doubles (real, imag).
 _COMPLEX_BYTES = 16
@@ -45,7 +49,9 @@ def estimate(program: Program, mode: str) -> dict[str, object]:
     """Return the deterministic estimate payload for *program* and *mode*."""
     base, qubit_limit = _MODE_TABLE[mode]
 
-    gate_counts = {name: 0 for name in _GATE_ORDER}
+    extended = any(op.kind in _EXTENDED_GATES for op in program.operations)
+    gate_order = _GATE_ORDER_V2 if extended else _GATE_ORDER_V1
+    gate_counts = {name: 0 for name in gate_order}
     gate_count = 0
     measurement_count = 0
     for op in program.operations:
@@ -57,7 +63,7 @@ def estimate(program: Program, mode: str) -> dict[str, object]:
 
     entry_count = base**program.num_qubits
     result = {
-        "schema_version": 1,
+        "schema_version": 2 if extended else 1,
         "mode": mode,
         "num_qubits": program.num_qubits,
         "num_clbits": program.num_clbits,
