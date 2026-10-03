@@ -356,7 +356,7 @@ probs = circuit.probabilities()   # 与 probabilities 命令的 JSON 对象一�
 - `Circuit(num_qubits, num_clbits)`：寄存器尺寸为 1 至 20 的整数（拒绝布尔值）。链式方法 `x`、`h`、`y`、`z`、`s`、`sdg`、`t`、`tdg`、`cx`、`cz`、`swap`、`rx`、`ry`、`rz`、`crx`、`cry`、`crz` 与逐位 `measure(qubit, clbit)` 按加入顺序追加操作并返回同一线路对象；旋转门签名为 `rx(angle, qubit)`、`crx(angle, control, target)`。
 - 下标必须是非布尔整数且在对应寄存器范围内；受控门的控制位与目标位不得相同；角度只接受有限的整数或浮点数。每个量子位、经典位最多参与一次测量，测量开始后不能再添加量子门。类型不符抛出 `TypeError`，越界、非有限角度及语义冲突抛出 `ValueError`；失败的追加不改变线路。
 - `to_qasm()` 生成可被本仓库解析器接受的 OpenQASM 文本，角度使用可还原为同一浮点值的最短十进制表示（负零写作 `0`）；`Circuit.from_qasm(text)` 从文本创建线路，解析与语义错误继续抛出 `ParseError`/`ValidationError` 并保留行列位置。
-- `sample(shots=1024, seed=0, noise_model=None)` 与 `probabilities(noise_model=None)` 复用命令行的仿真与采样路径，返回字典与同一线路经 `simulate`/`probabilities` 命令得到的 JSON 对象字段与值完全一致（含默认参数、测量位序、无测量结果、噪声通道顺序与量子位上限）；调用不修改线路，相同参数的重复调用返回相等结果，且各次调用不共享随机状态。`noise_model` 直接接受映射，沿用四类通道与概率校验，非法模型抛出 `NoiseModelError`；`shots` 非正或非整数、`seed` 非整数分别抛出 `ValueError`/`TypeError`。
+- `sample(shots=1024, seed=0, noise_model=None)` 与 `probabilities(noise_model=None)` 与命令行共用同一套与命令行无关的仿真核心（状态演化、测量概率聚合、采样与结果组装），返回字典与同一线路经 `simulate`/`probabilities` 命令得到的 JSON 对象字段与值完全一致（含默认参数、测量位序、无测量结果、噪声通道顺序与量子位上限）；即使从未导入 `quantum_circuit.cli`，两者也可独立使用。调用不修改线路，相同参数的重复调用返回相等结果，且各次调用不共享随机状态。`noise_model` 直接接受映射，沿用四类通道与概率校验，非法模型抛出 `NoiseModelError`；`shots` 非正或非整数、`seed` 非整数分别抛出 `ValueError`/`TypeError`。
 - 包同时导出 `ParseError`、`ValidationError` 与 `NoiseModelError`；`quantum_circuit.__version__` 保持不变。
 
 ### 结果导出（`--output PATH`）

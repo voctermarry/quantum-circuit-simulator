@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import math
 
-from .noise import MAX_NOISE_QUBITS, validate_noise_model
+from .core import SimulationError, run_probabilities, run_simulation
+from .noise import validate_noise_model
 from .openqasm import Operation, Program, parse
 from .optimizer import _format_angle
 
@@ -331,13 +332,6 @@ class Circuit:
             return None
         return validate_noise_model(noise_model)
 
-    def _check_noise_qubit_limit(self, program: Program) -> None:
-        if program.num_qubits > MAX_NOISE_QUBITS:
-            raise ValueError(
-                f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
-                f"got {program.num_qubits}"
-            )
-
     def sample(self, shots: int = _DEFAULT_SHOTS, seed: int = _DEFAULT_SEED, noise_model=None) -> dict:
         """Sample the circuit, returning the ``simulate`` payload as a dict.
 
@@ -358,15 +352,12 @@ class Circuit:
             raise TypeError(f"seed must be an integer, got {type(seed).__name__}")
         model = self._prepare_noise_model(noise_model)
         program = self._to_program()
-        if model is not None:
-            self._check_noise_qubit_limit(program)
-
-        from .cli import _compute_simulation
-
-        result, error, _exit_code = _compute_simulation(program, model, shots, seed)
-        assert error is None, error  # limits were checked above
-        assert result is not None
-        return result
+        try:
+            return run_simulation(program, shots, seed, model)
+        except SimulationError as exc:
+            # The DSL reports the noisy size limit as a ValueError, matching
+            # its other value-range errors rather than the CLI's exit code 3.
+            raise ValueError(str(exc)) from None
 
     def probabilities(self, noise_model=None) -> dict:
         """Exact final-state measurement probabilities, as a dict.
@@ -377,20 +368,10 @@ class Circuit:
         """
         model = self._prepare_noise_model(noise_model)
         program = self._to_program()
-
-        from .cli import _probability_payload
-
-        if model is None:
-            from .simulator import simulate_state_vector
-
-            state = simulate_state_vector(program)
-            basis_probabilities = [abs(amplitude) ** 2 for amplitude in state]
-        else:
-            self._check_noise_qubit_limit(program)
-            from .noise import simulate_density_matrix
-
-            basis_probabilities = simulate_density_matrix(program, model)
-        return _probability_payload(program, basis_probabilities, model)
+        try:
+            return run_probabilities(program, model)
+        except SimulationError as exc:
+            raise ValueError(str(exc)) from None
 
 
 __all__ = ["Circuit"]
