@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、输出末态精确测量概率（不采样）的 `probabilities` 入口、计算末态测量之前一组 Pauli 乘积观测量期望值的 `expectation` 入口、按清单批量执行独立仿真的 `batch-simulate` 入口、按清单重跑并与历史批量结果对账的 `reconcile` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路（可单侧或双侧带噪）末态并量化单量子位熵的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、输出末态精确测量概率（不采样）的 `probabilities` 入口、用外部计数与理论分布做计数验证的 `verify-samples` 入口、计算末态测量之前一组 Pauli 乘积观测量期望值的 `expectation` 入口、按清单批量执行独立仿真的 `batch-simulate` 入口、按清单重跑并与历史批量结果对账的 `reconcile` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路（可单侧或双侧带噪）末态并量化单量子位熵的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
 
 ## 环境与安装
 
@@ -27,6 +27,7 @@ quantum-circuit-simulator version                # 打印版本号
 quantum-circuit-simulator --help                 # 打印用法
 quantum-circuit-simulator simulate circuit.qasm  # 仿真并采样
 quantum-circuit-simulator probabilities circuit.qasm  # 输出末态精确测量概率
+quantum-circuit-simulator verify-samples circuit.qasm samples.json  # 外部计数验证
 quantum-circuit-simulator expectation circuit.qasm observables.json  # 输出 Pauli 乘积观测量期望值
 quantum-circuit-simulator batch-simulate jobs.json  # 按清单批量仿真
 quantum-circuit-simulator reconcile jobs.json baseline.json  # 重跑清单并与历史结果对账
@@ -88,6 +89,36 @@ quantum-circuit-simulator probabilities SOURCE [--noise-model PATH] [--output PA
 - 绝对值不超过 `1e-15` 的项省略不写；与 1 的差不超过 `1e-15` 的项写为 `1`；其余项为 0 到 1 之间的有限 JSON 数字，所有输出项之和与 1 的误差不超过 `1e-12`，不会出现 NaN、Infinity 或负零。
 - 错误语义、错误名称与退出码沿用 `simulate`（源文件 `io_error` 为 1；`parse_error`、`validation_error`、`noise_model_error` 为 2；带噪声线路超过 10 个量子位的 `simulation_error` 为 3；参数错误为退出码 2 的用法错误），失败时 stdout 为空。
 - 相同输入重复执行产生字节一致的 stdout。
+
+### verify-samples 子命令
+
+```bash
+quantum-circuit-simulator verify-samples SOURCE SAMPLES [--noise-model PATH] [--tolerance D] [--output PATH]
+```
+
+- `SOURCE` 与 `--noise-model` 的文件、UTF-8、标准输入（`-`）与相对路径语义完全沿用 `simulate`/`probabilities`。
+- `SAMPLES`：UTF-8 编码的 JSON 样本文件路径，`-` 表示从标准输入。样本根对象只允许 `schema_version` 与 `counts` 两个键，均必填；`schema_version` 必须为整数 `1`；`counts` 为非空对象，键必须与经典寄存器等宽且只含 `0`、`1`，值为非布尔正整数。
+- `SOURCE`、`SAMPLES`、`--noise-model` 三个可从标准输入读取的参数至多一个为 `-`；违反时不读取标准输入，stdout 为空，stderr 输出单行 `verification_error`，退出码 2。
+- 样本文件不可读或不是合法 UTF-8 时，stderr 输出带 `"input": "samples"` 的单行 `io_error`，退出码 1。
+- 样本 JSON 的语法错误、重复或未知键、字段缺失或类型错误（含布尔值冒充整数、非有限常量 `NaN`/`Infinity`）、结果键宽度或字符非法、`counts` 为空、计数值不是正整数，均在任何状态演化之前令请求失败：stdout 为空，stderr 输出单行 `sample_input_error`，退出码 2。
+- 命令先完成样本解析与校验，再演化状态。线路与噪声模型沿用 `simulate`/`probabilities` 的既有错误类型、校验顺序及量子位限制（无噪声最多 20 位，带噪声最多 10 位）。
+- `--tolerance D`：默认 `0.05`，只接受 `0` 到 `1` 的有限数；非法值为退出码 2 的参数用法错误，且不读取任何输入。
+
+理论概率按 `probabilities` 的口径聚合到经典结果（含近零省略、近一写一与重归一化）；计数除以总计数归一化为经验概率，未出现的合法结果视为零。在两类概率键的并集上计算
+
+```
+total_variation_distance = 0.5 * Σ |expected − observed|
+```
+
+距离不大于 `tolerance` 即判定通过。成功时 stdout 仅输出一行确定性 JSON，字段顺序固定为 `schema_version`、`num_qubits`、`num_clbits`、`shots`、`noise_model`、`tolerance`、`total_variation_distance`、`accepted`、`expected_probabilities`、`observed_probabilities`，其中 `schema_version` 为 1；无噪声模型时 `noise_model` 为 `null`，提供模型时按固定通道顺序回显：
+
+```json
+{"schema_version": 1, "num_qubits": 2, "num_clbits": 2, "shots": 100, "noise_model": null, "tolerance": 0.05, "total_variation_distance": 0.0, "accepted": true, "expected_probabilities": {"00": 0.5, "11": 0.5}, "observed_probabilities": {"00": 0.5, "11": 0.5}}
+```
+
+- `shots` 为样本计数之和；两个概率对象均按键排序。概率值沿用既有规范：有限 JSON 数字、绝对值不超过 `1e-15` 归零（写为 `0.0`，不出现负零）、与 1 之差不超过 `1e-15` 写为 `1`，并夹取到 `[0, 1]`。
+- 通过时退出码为 0；距离超过容差时仍输出完整报告，stderr 为空，退出码为 3，`accepted` 为 `false`。
+- 相同输入重复执行产生字节一致的 stdout；`--output` 沿用既有原子导出与输入路径冲突保护（样本文件同样受保护）。
 
 ### expectation 子命令
 
@@ -333,17 +364,17 @@ probs = circuit.probabilities()   # 与 probabilities 命令的 JSON 对象一�
 - 包同时导出 `ParseError`、`ValidationError` 与 `NoiseModelError`；`quantum_circuit.__version__` 保持不变。
 
 ### 结果导出（`--output PATH`）
-`simulate`、`probabilities`、`expectation`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 九个子命令均支持可选的 `--output PATH`，用于把结果直接导出到文件，调用方无需再重定向标准输出。
+`simulate`、`probabilities`、`verify-samples`、`expectation`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 十个子命令均支持可选的 `--output PATH`，用于把结果直接导出到文件，调用方无需再重定向标准输出。
 
 - 省略该选项时，stdout、stderr、退出码及字节内容与既有行为完全一致。
 - 提供普通文件路径时，命令在结果可产出后，把原本应写入 stdout 的完整 UTF-8 JSON 行连同末尾换行写入该文件；此情况下 stdout 保持为空。文件字节内容与未指定 `--output` 时的 stdout 完全相同，因此 JSON 字段、字段顺序、数值规范、随机种子、噪声顺序、任务隔离与规模限制均不改变；同一输入导出到不同可写路径的内容完全一致。
 - 相对路径以当前工作目录为基准（不以清单或源文件所在目录为基准）；父目录必须已存在。目标可以是新文件或已有普通文件；覆盖已有文件时原子替换，并保留原文件权限。`PATH` 不能是 `-`，也不能是目录。
-- 导出覆盖正常退出码为 0 的结果，也覆盖 `batch-simulate` 含任务级失败、`reconcile` 发现差异时仍产出的完整报告：这两种情况成功写出后继续返回既有退出码 3，文件内容与不使用 `--output` 时的 stdout 字节一致。
+- 导出覆盖正常退出码为 0 的结果，也覆盖 `batch-simulate` 含任务级失败、`reconcile` 发现差异、`verify-samples` 距离超过容差时仍产出的完整报告：这些情况成功写出后继续返回既有退出码 3，文件内容与不使用 `--output` 时的 stdout 字节一致。
 - 除路径冲突外，命令先按原规则完成参数、输入、解析、验证与计算；任何既有失败都不会创建、截断或替换目标文件。只有在报告已经生成后才尝试提交导出。
 - 为避免一次导出破坏可复现输入，目标路径经绝对化和规范化后，不得与本次命令读取的任何非标准输入文件相同。受保护的输入包括：
-  - 直接线路（`simulate`/`probabilities`/`expectation`/`optimize`/`estimate` 的 `SOURCE`，`equivalent`/`state-metrics` 的 `LEFT`、`RIGHT`）；
-  - 直接噪声模型（`simulate`/`probabilities`/`expectation` 的 `--noise-model`，`state-metrics` 的 `--left-noise-model`、`--right-noise-model`）；
-  - `expectation` 的 `OBSERVABLES` 观测量文件；
+  - 直接线路（`simulate`/`probabilities`/`verify-samples`/`expectation`/`optimize`/`estimate` 的 `SOURCE`，`equivalent`/`state-metrics` 的 `LEFT`、`RIGHT`）；
+  - 直接噪声模型（`simulate`/`probabilities`/`verify-samples`/`expectation` 的 `--noise-model`，`state-metrics` 的 `--left-noise-model`、`--right-noise-model`）；
+  - `expectation` 的 `OBSERVABLES` 观测量文件与 `verify-samples` 的 `SAMPLES` 样本文件；
   - 批量清单与 `reconcile` 基线；
   - 有效清单内引用的线路与噪声模型（即使该文件当前缺失或不可读，路径仍受保护）。
 - 路径冲突在任何仿真或重跑任务执行之前检出：不运行仿真、不重跑任务、不修改文件，stderr 输出单行 `{"error":"output_error",...}`，退出码为 2。
@@ -364,6 +395,12 @@ probs = circuit.probabilities()   # 与 probabilities 命令的 JSON 对象一�
 | 带噪声线路超过 10 个量子位 | 3 | `simulation_error` |
 | `probabilities` 的源文件/噪声模型读取、词法语法、语义及噪声模型错误，以及线路与模型同时取 `-` | 与 `simulate` 相同：`io_error` 1、`parse_error`/`validation_error`/`noise_model_error` 2、带噪声超 10 量子位的 `simulation_error` 3（失败时 stdout 为空） |
 | `probabilities` 传入 `--shots`/`--seed` 等不支持的参数 | 2 | 参数用法错误 |
+| `verify-samples` 样本文件不存在、不可读或不是合法 UTF-8 | 1 | `io_error`（带 `input`：`samples`） |
+| `verify-samples` 的线路源、样本、噪声模型中两个及以上取 `-`（此时不读取标准输入） | 2 | `verification_error` |
+| `verify-samples` 样本 JSON 语法错误，或结构/类型/数值不合规（重复或未知键、必填字段缺失、`schema_version` 非整数 1、`counts` 为空、结果键与经典寄存器不等宽或含非 `0`/`1` 字符、计数值为非布尔正整数等；此时不进行任何状态演化） | 2 | `sample_input_error` |
+| `verify-samples` 非法 `--tolerance`（非 `0` 到 `1` 的有限数；不读取输入） | 2 | 参数用法错误 |
+| `verify-samples` 的线路/噪声模型读取与解析、带噪声超 10 量子位 | 与 `simulate` 相同：`io_error` 1、`parse_error`/`validation_error`/`noise_model_error` 2、`simulation_error` 3（失败时 stdout 为空）；无噪声沿用 20 位上限 |
+| `verify-samples` 距离超过容差（完整报告仍写入 stdout，stderr 为空） | 3 | 报告内 `accepted` 为 `false`（`total_variation_distance` 大于 `tolerance`） |
 | `expectation` 观测量文件不存在、不可读或不是合法 UTF-8 | 1 | `io_error`（带 `input`：`observables`） |
 | `expectation` 的线路源、观测量、噪声模型中两个及以上取 `-`（此时不读取标准输入） | 2 | `expectation_error` |
 | `expectation` 观测量 JSON 语法错误，或结构/类型/数值不合规（重复或未知键、`schema_version` 非整数 1、数量越界、`id` 为空或重复、非法 `pauli`、`qubit` 非范围内非布尔整数或项内重复等；此时不进行任何状态演化） | 2 | `observable_error` |
@@ -397,7 +434,7 @@ probs = circuit.probabilities()   # 与 probabilities 命令的 JSON 对象一�
 
 ## 现有公开接口
 
-- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`probabilities`、`expectation`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
+- 命令行程序 `quantum-circuit-simulator`（`version`、`simulate`、`probabilities`、`verify-samples`、`expectation`、`batch-simulate`、`reconcile`、`equivalent`、`optimize`、`state-metrics` 与 `estimate` 子命令）
 - Python 包 `quantum_circuit`，其 `__version__` 为当前版本号，并导出 `Circuit` 线路 DSL（见「Python 线路 DSL」一节）及 `ParseError`、`ValidationError`、`NoiseModelError` 异常类型
 
 ## 限制

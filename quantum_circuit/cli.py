@@ -524,6 +524,249 @@ def _probabilities(
     return _finish(ctx, result, 0)
 
 
+# -------------------------------------------------------------- verify-samples
+
+VERIFY_SCHEMA_VERSION = 1
+_SAMPLES_ROOT_KEYS = ("schema_version", "counts")
+DEFAULT_VERIFY_TOLERANCE = 0.05
+
+
+class _SampleInputError(Exception):
+    """The samples document is structurally invalid (``sample_input_error``)."""
+
+
+def _reject_samples_constant(value: str) -> None:
+    raise _SampleInputError(f"samples document contains non-JSON constant {value!r}")
+
+
+def _samples_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _SampleInputError(f"duplicate key {key!r} in samples document")
+        result[key] = value
+    return result
+
+
+def _tolerance_value(value: str) -> float:
+    """Parse ``--tolerance``: a finite JSON-style number in ``[0, 1]``."""
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be a finite number between 0 and 1, got {value!r}"
+        ) from None
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"must be a finite number between 0 and 1, got {value!r}"
+        )
+    return parsed
+
+
+def _validate_samples_document(
+    data: object, num_clbits: int
+) -> tuple[dict[str, int], int]:
+    """Validate the parsed samples document against the classical register.
+
+    Returns the raw counts and their total (the shot count). Raises
+    :class:`_SampleInputError` on any structural, type, range or key-width
+    problem. Validation is purely structural: it runs before any state is
+    evolved.
+    """
+    if not isinstance(data, dict):
+        raise _SampleInputError("samples document must be a JSON object")
+    for key in data:
+        if key not in _SAMPLES_ROOT_KEYS:
+            raise _SampleInputError(f"unknown samples document key {key!r}")
+
+    if "schema_version" not in data:
+        raise _SampleInputError("samples document is missing required key 'schema_version'")
+    schema_version = data["schema_version"]
+    if not _is_json_int(schema_version) or schema_version != VERIFY_SCHEMA_VERSION:
+        raise _SampleInputError(
+            f"samples document schema_version must be {VERIFY_SCHEMA_VERSION}, "
+            f"got {schema_version!r}"
+        )
+
+    if "counts" not in data:
+        raise _SampleInputError("samples document is missing required key 'counts'")
+    counts = data["counts"]
+    if not isinstance(counts, dict) or not counts:
+        raise _SampleInputError("samples document 'counts' must be a non-empty JSON object")
+
+    total = 0
+    for key, value in counts.items():
+        if not isinstance(key, str) or len(key) != num_clbits or any(bit not in "01" for bit in key):
+            raise _SampleInputError(
+                f"samples document 'counts' key {key!r} is not a "
+                f"{num_clbits}-bit measurement string"
+            )
+        if not _is_json_int(value) or value <= 0:
+            raise _SampleInputError(
+                "samples document 'counts' values must be non-boolean positive integers"
+            )
+        total += value
+    return counts, total
+
+
+def _read_samples_document(
+    samples_arg: str, ctx: _RunContext | None
+) -> tuple[str | None, int | None]:
+    """Read the UTF-8 samples JSON document from a path or ``-`` (stdin).
+
+    Returns ``(text, None)`` on success or ``(None, exit_code)`` after a
+    single ``io_error`` line tagged with ``input`` ``"samples"``.
+    """
+    try:
+        if samples_arg == "-":
+            data = sys.stdin.buffer.read()
+        else:
+            with open(samples_arg, "rb") as handle:
+                data = handle.read()
+    except OSError as exc:
+        _emit_error(
+            "io_error",
+            f"cannot read samples {samples_arg!r}: {exc.strerror or exc}",
+            side="samples",
+        )
+        return None, 1
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _emit_error(
+            "io_error",
+            f"samples {samples_arg!r} is not valid UTF-8: {exc}",
+            side="samples",
+        )
+        return None, 1
+
+    if ctx is not None and samples_arg != "-":
+        ctx.register_input(samples_arg)
+    return text, None
+
+
+def _snap_unit_value(value: float) -> float:
+    """Snap one ``[0, 1]`` value for deterministic output.
+
+    Mirrors the probability conventions: magnitude at most ``1e-15`` is
+    reported as ``0.0`` (never negative zero), within ``1e-15`` of 1 as
+    ``1.0``, otherwise a finite float clamped to ``[0, 1]``.
+    """
+    if abs(value) <= _PROBABILITY_ZERO_TOLERANCE:
+        return 0.0
+    if abs(1.0 - value) <= _PROBABILITY_ONE_TOLERANCE:
+        return 1.0
+    return min(1.0, max(0.0, float(value)))
+
+
+def _verify_samples(
+    source_arg: str,
+    samples_arg: str,
+    noise_model_arg: str | None,
+    tolerance: float,
+    ctx: _RunContext | None = None,
+) -> int:
+    # Three inputs may request standard input; at most one may be '-'. The
+    # conflict is detected before any input is read.
+    stdin_args = [source_arg, samples_arg]
+    if noise_model_arg is not None:
+        stdin_args.append(noise_model_arg)
+    if sum(value == "-" for value in stdin_args) > 1:
+        _emit_error(
+            "verification_error",
+            "at most one of the circuit source, samples document and noise model "
+            "can be read from standard input",
+        )
+        return 2
+
+    # Circuit and noise model use the exact simulate/probabilities path
+    # (reading, UTF-8, parsing, validation, model normalization, ordering).
+    program, noise_model, error, exit_code = _prepare_simulation(
+        source_arg, noise_model_arg, ctx=ctx
+    )
+    if error is not None:
+        _emit_error_payload(error)
+        return exit_code
+    assert program is not None
+
+    samples_text, read_code = _read_samples_document(samples_arg, ctx)
+    if samples_text is None:
+        return read_code if read_code is not None else 1
+
+    # The samples document is fully validated against the parsed classical
+    # register width before any state is evolved.
+    try:
+        data = json.loads(
+            samples_text,
+            object_pairs_hook=_samples_pairs,
+            parse_constant=_reject_samples_constant,
+        )
+        counts, shots = _validate_samples_document(data, program.num_clbits)
+    except (json.JSONDecodeError, _SampleInputError) as exc:
+        message = (
+            f"samples document is not valid JSON: {exc}"
+            if isinstance(exc, json.JSONDecodeError)
+            else str(exc)
+        )
+        _emit_error("sample_input_error", message)
+        return 2
+
+    # Refuse an input-overwriting export before any state is evolved.
+    if ctx is not None and (code := _guard_output_conflict(ctx)) is not None:
+        return code
+
+    if noise_model is None:
+        # The parser already caps the register at the 20-qubit state-vector
+        # limit.
+        state = simulate_state_vector(program)
+        basis_probabilities = [abs(amplitude) ** 2 for amplitude in state]
+    else:
+        if program.num_qubits > MAX_NOISE_QUBITS:
+            _emit_error(
+                "simulation_error",
+                f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
+                f"got {program.num_qubits}",
+            )
+            return 3
+        basis_probabilities = simulate_density_matrix(program, noise_model)
+
+    # The theoretical distribution is built by the exact probabilities path
+    # (measurement aggregation, renormalization, near-zero omission and
+    # near-one snapping).
+    expected_probabilities: dict[str, float] = _probability_payload(
+        program, basis_probabilities, noise_model
+    )["probabilities"]
+
+    # Counts normalize to empirical probabilities; outcomes absent from the
+    # counts are treated as zero on the union below.
+    observed_probabilities = {
+        key: _snap_unit_value(counts[key] / shots) for key in sorted(counts)
+    }
+
+    all_keys = sorted(set(expected_probabilities) | set(observed_probabilities))
+    distance = 0.5 * math.fsum(
+        abs(expected_probabilities.get(key, 0.0) - observed_probabilities.get(key, 0.0))
+        for key in all_keys
+    )
+    distance = _snap_unit_value(distance)
+
+    result: dict[str, object] = {
+        "schema_version": VERIFY_SCHEMA_VERSION,
+        "num_qubits": program.num_qubits,
+        "num_clbits": program.num_clbits,
+        "shots": shots,
+        "noise_model": noise_model,
+        "tolerance": tolerance,
+        "total_variation_distance": distance,
+        "accepted": distance <= tolerance,
+        "expected_probabilities": expected_probabilities,
+        "observed_probabilities": observed_probabilities,
+    }
+    # A report is produced either way; only the exit code distinguishes them.
+    return _finish(ctx, result, 0 if distance <= tolerance else 3)
+
+
 # --------------------------------------------------------------- expectation
 
 
@@ -1732,6 +1975,37 @@ def main(argv: list[str] | None = None) -> int:
         help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
     )
 
+    verify_parser = sub.add_parser(
+        "verify-samples",
+        help="compare external measurement counts against exact theoretical probabilities",
+    )
+    verify_parser.add_argument(
+        "source", help="path to the OpenQASM source file, or '-' for stdin"
+    )
+    verify_parser.add_argument(
+        "samples",
+        help="path to the UTF-8 JSON samples document, or '-' for stdin",
+    )
+    verify_parser.add_argument(
+        "--noise-model",
+        metavar="PATH",
+        default=None,
+        help="optional JSON noise model for density-matrix probabilities ('-' reads stdin)",
+    )
+    verify_parser.add_argument(
+        "--tolerance",
+        metavar="D",
+        type=_tolerance_value,
+        default=DEFAULT_VERIFY_TOLERANCE,
+        help="maximum accepted total variation distance in [0, 1] (default: 0.05)",
+    )
+    verify_parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
+    )
+
     expectation_parser = sub.add_parser(
         "expectation",
         help="report Pauli-product observable expectation values of the final pre-measurement state",
@@ -1871,6 +2145,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "probabilities":
         return _probabilities(args.source, args.noise_model, ctx)
+
+    if args.command == "verify-samples":
+        return _verify_samples(
+            args.source,
+            args.samples,
+            args.noise_model,
+            args.tolerance,
+            ctx,
+        )
 
     if args.command == "expectation":
         return _expectation(args.source, args.observables, args.noise_model, ctx)

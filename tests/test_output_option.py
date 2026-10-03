@@ -523,6 +523,7 @@ def test_failed_export_writes_nothing_to_stdout(env):
     [
         "simulate",
         "probabilities",
+        "verify-samples",
         "expectation",
         "equivalent",
         "optimize",
