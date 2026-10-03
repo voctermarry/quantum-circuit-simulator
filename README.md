@@ -176,24 +176,33 @@ quantum-circuit-simulator equivalent LEFT RIGHT [--output PATH]
 ### state-metrics 子命令
 
 ```bash
-quantum-circuit-simulator state-metrics LEFT RIGHT [--output PATH]
+quantum-circuit-simulator state-metrics LEFT RIGHT [--left-noise-model PATH] [--right-noise-model PATH] [--output PATH]
 ```
 
-- `LEFT`、`RIGHT`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取，但两侧不能同时为 `-`（此时不读取标准输入）。
-- 两份无噪声线路各自从全零初态演化（忽略末尾测量，不要求测量布局一致），比较所得末态并量化每个量子位与其余系统的纠缠；沿用现有解析、门语义与寄存器上限（最多 20 个量子位）。
+- `LEFT`、`RIGHT`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取。
+- `--left-noise-model` / `--right-noise-model`：可选的 UTF-8 JSON 噪声模型文件路径，分别作用于左、右线路；`-` 表示从标准输入读取。四个输入中至多一个可为 `-`（违反时不读取标准输入，报 `metrics_error`，退出码 2）。
+- 两份线路各自从全零初态演化（忽略末尾测量，测量布局不参与比较），比较所得末态并量化每个量子位与其余系统的纠缠；沿用现有解析、门语义与寄存器上限。不提供噪声模型的一侧按纯态演化（最多 20 个量子位）；提供模型的一侧沿用 `simulate` 的四类通道、规范化顺序与逐门施噪语义演化完整密度矩阵（最多 10 个量子位，超限报带 `input` 的 `simulation_error`，退出码 3）。
 
-成功时 stdout 输出单行 JSON，字段顺序固定为 `schema_version`、`left_num_qubits`、`right_num_qubits`、`reason`、`fidelity`、`left_single_qubit_entropy`、`right_single_qubit_entropy`，其中 `schema_version` 为 1：
+两侧都不提供噪声模型时，成功输出与既往版本完全一致：字段顺序固定为 `schema_version`、`left_num_qubits`、`right_num_qubits`、`reason`、`fidelity`、`left_single_qubit_entropy`、`right_single_qubit_entropy`，其中 `schema_version` 为 1：
 
 ```json
 {"schema_version": 1, "left_num_qubits": 2, "right_num_qubits": 2, "reason": "compared", "fidelity": 1.0, "left_single_qubit_entropy": [1.0, 1.0], "right_single_qubit_entropy": [1.0, 1.0]}
 ```
 
+任一侧提供噪声模型时，`schema_version` 为 2，字段顺序固定为 `schema_version`、`left_num_qubits`、`right_num_qubits`、`reason`、`left_noise_model`、`right_noise_model`、`fidelity`、`left_purity`、`right_purity`、`left_single_qubit_entropy`、`right_single_qubit_entropy`：
+
+```json
+{"schema_version": 2, "left_num_qubits": 1, "right_num_qubits": 1, "reason": "compared", "left_noise_model": {"depolarizing": 1.0}, "right_noise_model": null, "fidelity": 0.5, "left_purity": 0.5, "right_purity": 1.0, "left_single_qubit_entropy": [1.0], "right_single_qubit_entropy": [0.0]}
+```
+
+- `left_noise_model` / `right_noise_model`：对应侧的规范化噪声模型（按固定通道顺序仅回显已给概率），未提供模型的一侧为 `null`。
 - `reason`：量子位数相同时为 `compared`，否则为 `qubit_count_mismatch`。
-- `fidelity`：两侧归一化末态内积的模平方；量子位数不同时为 `null`。
+- `fidelity`：量子位数相同时为两侧末态的平方 Uhlmann 保真度（纯态对纯态时等于归一化内积的模平方）；量子位数不同时为 `null`。
+- `left_purity` / `right_purity`：两侧末态的纯度 `Tr(ρ²)`；纯态为 1。量子位数不同时仍分别返回。
 - `left_single_qubit_entropy` / `right_single_qubit_entropy`：按量子位下标升序，每项为该位约化密度矩阵以 2 为底的冯诺依曼熵（零本征值不贡献）；乘积态为 0，Bell 态的两个量子位均为 1。量子位数不同时仍分别计算两侧熵数组。
 - 数值限制在定义域内：绝对值不超过 `1e-15` 时输出 `0`，与 1 的差不超过 `1e-15` 时输出 `1`，不会出现 NaN、Infinity 或负零；相同输入重复调用产生字节一致的 JSON。
 
-失败时（退出码非 0）stdout 为空，stderr 输出单行 JSON，错误对象带 `input` 字段标明出错的一侧（`left` 或 `right`）；两侧都有问题时按 LEFT、RIGHT 顺序报告首个错误。
+失败时（退出码非 0）stdout 为空，stderr 输出单行 JSON，错误对象带 `input` 字段标明出错的一侧（`left` 或 `right`）。源文件错误沿用既有语义（`io_error` 为 1，`parse_error`、`validation_error` 为 2）；噪声模型文件不可读报 `io_error`（退出码 1），内容不合规报 `noise_model_error`（退出码 2）。四个输入都有问题时按左源、左模型、右源、右模型顺序报告首个错误。
 
 ### optimize 子命令
 

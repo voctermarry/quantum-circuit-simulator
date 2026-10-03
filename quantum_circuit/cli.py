@@ -18,10 +18,19 @@ from .equivalence import (
     unitary_distance,
 )
 from .estimation import estimate as estimate_program
-from .metrics import single_qubit_entropies, state_fidelity
+from .metrics import (
+    density_purity,
+    density_single_qubit_entropies,
+    pure_mixed_fidelity_squared,
+    single_qubit_entropies,
+    state_fidelity,
+    state_purity,
+    uhlmann_fidelity_squared,
+)
 from .noise import (
     MAX_NOISE_QUBITS,
     NoiseModelError,
+    evolve_density_matrix,
     parse_noise_model,
     simulate_density_matrix,
 )
@@ -1361,45 +1370,179 @@ def _equivalent(left_arg: str, right_arg: str, ctx: _RunContext | None = None) -
     return _finish(ctx, result, 0)
 
 
-def _state_metrics(left_arg: str, right_arg: str, ctx: _RunContext | None = None) -> int:
-    if left_arg == "-" and right_arg == "-":
-        # Standard input cannot serve both sides; do not read it.
+def _load_metrics_noise_model(side: str, noise_model_arg: str, ctx: _RunContext | None = None):
+    """Read and parse one noise model for a ``state-metrics`` side.
+
+    Returns the canonical model mapping, or an exit code (1 or 2) after
+    emitting the appropriate single-line error on stderr. Reading and error
+    semantics (``io_error`` for an unreadable file, ``noise_model_error``
+    for invalid UTF-8 or content) match ``simulate --noise-model``; *side*
+    is reported as ``input`` on every failure.
+    """
+    try:
+        if noise_model_arg == "-":
+            raw_model = sys.stdin.buffer.read()
+        else:
+            with open(noise_model_arg, "rb") as handle:
+                raw_model = handle.read()
+    except OSError as exc:
         _emit_error(
-            "metrics_error",
-            "left and right inputs cannot both be read from standard input",
+            "io_error",
+            f"cannot read noise model {noise_model_arg!r}: {exc.strerror or exc}",
+            side=side,
         )
+        return None, 1
+
+    try:
+        model_text = raw_model.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _emit_error(
+            "noise_model_error",
+            f"noise model {noise_model_arg!r} is not valid UTF-8: {exc}",
+            side=side,
+        )
+        return None, 2
+
+    try:
+        noise_model = parse_noise_model(model_text)
+    except NoiseModelError as exc:
+        _emit_error("noise_model_error", str(exc), side=side)
+        return None, 2
+
+    if ctx is not None and noise_model_arg != "-":
+        ctx.register_input(noise_model_arg)
+    return noise_model, None
+
+
+def _state_metrics(
+    left_arg: str,
+    right_arg: str,
+    left_noise_model_arg: str | None = None,
+    right_noise_model_arg: str | None = None,
+    ctx: _RunContext | None = None,
+) -> int:
+    stdin_uses = [
+        left_arg == "-",
+        left_noise_model_arg == "-",
+        right_arg == "-",
+        right_noise_model_arg == "-",
+    ]
+    if sum(stdin_uses) > 1:
+        # Standard input can serve at most one of the four inputs; do not
+        # read it.
+        if left_arg == "-" and right_arg == "-":
+            message = "left and right inputs cannot both be read from standard input"
+        else:
+            message = "at most one of the circuit and noise model inputs can be read from standard input"
+        _emit_error("metrics_error", message)
         return 2
 
-    # Fully validate each side (read, parse, semantics) in LEFT, RIGHT
+    # Fully validate each side (source, then noise model) in LEFT, RIGHT
     # order, reporting only the first failure.
     left, error_code = _load_program("left", left_arg, ctx)
     if left is None:
         return error_code
+    left_noise_model = None
+    if left_noise_model_arg is not None:
+        left_noise_model, error_code = _load_metrics_noise_model("left", left_noise_model_arg, ctx)
+        if left_noise_model is None:
+            return error_code
     right, error_code = _load_program("right", right_arg, ctx)
     if right is None:
         return error_code
+    right_noise_model = None
+    if right_noise_model_arg is not None:
+        right_noise_model, error_code = _load_metrics_noise_model("right", right_noise_model_arg, ctx)
+        if right_noise_model is None:
+            return error_code
 
     if ctx is not None and (guard := _guard_output_conflict(ctx)) is not None:
         return guard
 
-    left_state = simulate_state_vector(left)
-    right_state = simulate_state_vector(right)
+    if left_noise_model is None and right_noise_model is None:
+        left_state = simulate_state_vector(left)
+        right_state = simulate_state_vector(right)
+
+        if left.num_qubits == right.num_qubits:
+            reason = "compared"
+            fidelity: float | None = state_fidelity(left_state, right_state)
+        else:
+            reason = "qubit_count_mismatch"
+            fidelity = None
+
+        result: dict[str, object] = {
+            "schema_version": 1,
+            "left_num_qubits": left.num_qubits,
+            "right_num_qubits": right.num_qubits,
+            "reason": reason,
+            "fidelity": fidelity,
+            "left_single_qubit_entropy": single_qubit_entropies(left_state, left.num_qubits),
+            "right_single_qubit_entropy": single_qubit_entropies(right_state, right.num_qubits),
+        }
+        return _finish(ctx, result, 0)
+
+    # At least one side evolves as a full density matrix; that side is
+    # capped well below the state-vector register limit.
+    for side, program, model in (
+        ("left", left, left_noise_model),
+        ("right", right, right_noise_model),
+    ):
+        if model is not None and program.num_qubits > MAX_NOISE_QUBITS:
+            _emit_error(
+                "simulation_error",
+                f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
+                f"got {program.num_qubits}",
+                side=side,
+            )
+            return 3
+
+    left_rho = (
+        evolve_density_matrix(left, left_noise_model) if left_noise_model is not None else None
+    )
+    right_rho = (
+        evolve_density_matrix(right, right_noise_model) if right_noise_model is not None else None
+    )
+    left_state = simulate_state_vector(left) if left_rho is None else None
+    right_state = simulate_state_vector(right) if right_rho is None else None
 
     if left.num_qubits == right.num_qubits:
         reason = "compared"
-        fidelity: float | None = state_fidelity(left_state, right_state)
+        if left_rho is not None and right_rho is not None:
+            fidelity = uhlmann_fidelity_squared(left_rho, right_rho)
+        elif left_rho is not None:
+            assert right_state is not None
+            fidelity = pure_mixed_fidelity_squared(right_state, left_rho)
+        else:
+            assert left_state is not None and right_rho is not None
+            fidelity = pure_mixed_fidelity_squared(left_state, right_rho)
     else:
         reason = "qubit_count_mismatch"
         fidelity = None
 
-    result: dict[str, object] = {
-        "schema_version": 1,
+    result = {
+        "schema_version": 2,
         "left_num_qubits": left.num_qubits,
         "right_num_qubits": right.num_qubits,
         "reason": reason,
+        "left_noise_model": left_noise_model,
+        "right_noise_model": right_noise_model,
         "fidelity": fidelity,
-        "left_single_qubit_entropy": single_qubit_entropies(left_state, left.num_qubits),
-        "right_single_qubit_entropy": single_qubit_entropies(right_state, right.num_qubits),
+        "left_purity": (
+            density_purity(left_rho) if left_rho is not None else state_purity(left_state)
+        ),
+        "right_purity": (
+            density_purity(right_rho) if right_rho is not None else state_purity(right_state)
+        ),
+        "left_single_qubit_entropy": (
+            density_single_qubit_entropies(left_rho, left.num_qubits)
+            if left_rho is not None
+            else single_qubit_entropies(left_state, left.num_qubits)
+        ),
+        "right_single_qubit_entropy": (
+            density_single_qubit_entropies(right_rho, right.num_qubits)
+            if right_rho is not None
+            else single_qubit_entropies(right_state, right.num_qubits)
+        ),
     }
     return _finish(ctx, result, 0)
 
@@ -1494,10 +1637,22 @@ def main(argv: list[str] | None = None) -> int:
 
     metrics_parser = sub.add_parser(
         "state-metrics",
-        help="compare the noiseless final states of two circuits and measure per-qubit entanglement",
+        help="compare the final states of two circuits and measure per-qubit entanglement",
     )
     metrics_parser.add_argument("left", help="path to the left OpenQASM source file, or '-' for stdin")
     metrics_parser.add_argument("right", help="path to the right OpenQASM source file, or '-' for stdin")
+    metrics_parser.add_argument(
+        "--left-noise-model",
+        metavar="PATH",
+        default=None,
+        help="optional JSON noise model for the left circuit ('-' reads stdin)",
+    )
+    metrics_parser.add_argument(
+        "--right-noise-model",
+        metavar="PATH",
+        default=None,
+        help="optional JSON noise model for the right circuit ('-' reads stdin)",
+    )
     metrics_parser.add_argument(
         "--output",
         metavar="PATH",
@@ -1569,7 +1724,9 @@ def main(argv: list[str] | None = None) -> int:
         return _estimate(args.source, args.mode, ctx)
 
     if args.command == "state-metrics":
-        return _state_metrics(args.left, args.right, ctx)
+        return _state_metrics(
+            args.left, args.right, args.left_noise_model, args.right_noise_model, ctx
+        )
 
     parser.print_help()
     return 0
