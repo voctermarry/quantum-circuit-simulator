@@ -34,6 +34,13 @@ from .noise import (
     parse_noise_model,
     simulate_density_matrix,
 )
+from .observables import (
+    ObservableError,
+    density_matrix_expectation,
+    parse_observables,
+    snap_expectation,
+    state_vector_expectation,
+)
 from .openqasm import ParseError, Program, ValidationError, parse
 from .optimizer import optimize as optimize_program
 from .simulator import (
@@ -514,6 +521,133 @@ def _probabilities(
         basis_probabilities = simulate_density_matrix(program, noise_model)
 
     result = _probability_payload(program, basis_probabilities, noise_model)
+    return _finish(ctx, result, 0)
+
+
+# --------------------------------------------------------------- expectation
+
+
+def _read_observables_document(
+    observables_arg: str, ctx: _RunContext | None
+) -> tuple[str | None, int | None]:
+    """Read the UTF-8 observables JSON document from a path or ``-``.
+
+    Returns ``(text, None)`` on success or ``(None, exit_code)`` after a
+    single ``io_error`` line tagged with ``input`` ``"observables"``.
+    """
+    try:
+        if observables_arg == "-":
+            data = sys.stdin.buffer.read()
+        else:
+            with open(observables_arg, "rb") as handle:
+                data = handle.read()
+    except OSError as exc:
+        _emit_error(
+            "io_error",
+            f"cannot read observables {observables_arg!r}: {exc.strerror or exc}",
+            side="observables",
+        )
+        return None, 1
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _emit_error(
+            "io_error",
+            f"observables {observables_arg!r} is not valid UTF-8: {exc}",
+            side="observables",
+        )
+        return None, 1
+
+    if ctx is not None and observables_arg != "-":
+        ctx.register_input(observables_arg)
+    return text, None
+
+
+def _expectation(
+    source_arg: str,
+    observables_arg: str,
+    noise_model_arg: str | None,
+    ctx: _RunContext | None = None,
+) -> int:
+    # Three inputs may request standard input; at most one may be '-'. The
+    # conflict is detected before any input is read.
+    stdin_args = [source_arg, observables_arg]
+    if noise_model_arg is not None:
+        stdin_args.append(noise_model_arg)
+    if sum(value == "-" for value in stdin_args) > 1:
+        _emit_error(
+            "expectation_error",
+            "at most one of the circuit source, observables document and noise model "
+            "can be read from standard input",
+        )
+        return 2
+
+    # Circuit and noise model use the exact simulate/probabilities path
+    # (reading, UTF-8, parsing, validation, model normalization).
+    program, noise_model, error, exit_code = _prepare_simulation(
+        source_arg, noise_model_arg, ctx=ctx
+    )
+    if error is not None:
+        _emit_error_payload(error)
+        return exit_code
+    assert program is not None
+
+    observables_text, read_code = _read_observables_document(observables_arg, ctx)
+    if observables_text is None:
+        return read_code if read_code is not None else 1
+
+    # The observables document is fully validated against the parsed
+    # register size before any state is evolved.
+    try:
+        observables = parse_observables(observables_text, program.num_qubits)
+    except ObservableError as exc:
+        _emit_error("observable_error", str(exc))
+        return 2
+
+    # Refuse an input-overwriting export before any state is evolved.
+    if ctx is not None and (code := _guard_output_conflict(ctx)) is not None:
+        return code
+
+    if noise_model is None:
+        # The parser already caps the register at the 20-qubit
+        # state-vector limit.
+        state = simulate_state_vector(program)
+        results = [
+            {
+                "id": observable_id,
+                "expectation": snap_expectation(state_vector_expectation(state, operators)),
+            }
+            for observable_id, operators in observables
+        ]
+        result: dict[str, object] = {
+            "schema_version": 1,
+            "num_qubits": program.num_qubits,
+            "noise_model": None,
+            "results": results,
+        }
+    else:
+        if program.num_qubits > MAX_NOISE_QUBITS:
+            _emit_error(
+                "simulation_error",
+                f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
+                f"got {program.num_qubits}",
+            )
+            return 3
+        rho = normalized_density_matrix(evolve_density_matrix(program, noise_model))
+        results = [
+            {
+                "id": observable_id,
+                "expectation": snap_expectation(density_matrix_expectation(rho, operators)),
+            }
+            for observable_id, operators in observables
+        ]
+        result = {
+            "schema_version": 1,
+            "num_qubits": program.num_qubits,
+            "noise_model": noise_model,
+            "results": results,
+        }
     return _finish(ctx, result, 0)
 
 
@@ -1598,6 +1732,30 @@ def main(argv: list[str] | None = None) -> int:
         help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
     )
 
+    expectation_parser = sub.add_parser(
+        "expectation",
+        help="report Pauli-product observable expectation values of the final pre-measurement state",
+    )
+    expectation_parser.add_argument(
+        "source", help="path to the OpenQASM source file, or '-' for stdin"
+    )
+    expectation_parser.add_argument(
+        "observables",
+        help="path to the UTF-8 JSON observables document, or '-' for stdin",
+    )
+    expectation_parser.add_argument(
+        "--noise-model",
+        metavar="PATH",
+        default=None,
+        help="optional JSON noise model for density-matrix evolution ('-' reads stdin)",
+    )
+    expectation_parser.add_argument(
+        "--output",
+        metavar="PATH",
+        default=None,
+        help="write the result JSON line to PATH instead of stdout ('-' is not allowed)",
+    )
+
     equivalent_parser = sub.add_parser(
         "equivalent",
         help="check whether two noiseless OpenQASM circuits implement the same transformation",
@@ -1713,6 +1871,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "probabilities":
         return _probabilities(args.source, args.noise_model, ctx)
+
+    if args.command == "expectation":
+        return _expectation(args.source, args.observables, args.noise_model, ctx)
 
     if args.command == "batch-simulate":
         return _batch_simulate(args.manifest, ctx)
