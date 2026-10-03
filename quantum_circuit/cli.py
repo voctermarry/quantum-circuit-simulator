@@ -11,6 +11,14 @@ import sys
 import tempfile
 
 from . import __version__
+from .core import (
+    SimulationError,
+    basis_probabilities,
+    probabilities_result,
+    probability_payload,
+    sample_result,
+    snap_probability,
+)
 from .equivalence import (
     EQUIVALENCE_TOLERANCE,
     MAX_EQUIVALENCE_QUBITS,
@@ -32,7 +40,6 @@ from .noise import (
     NoiseModelError,
     evolve_density_matrix,
     parse_noise_model,
-    simulate_density_matrix,
 )
 from .observables import (
     ObservableError,
@@ -43,13 +50,7 @@ from .observables import (
 )
 from .openqasm import ParseError, Program, ValidationError, parse
 from .optimizer import optimize as optimize_program
-from .simulator import (
-    measurement_probabilities,
-    sample_counts,
-    sample_counts_from_probabilities,
-    simulate_state_vector,
-    unitary_matrix,
-)
+from .simulator import simulate_state_vector, unitary_matrix
 
 
 def _positive_int(value: str) -> int:
@@ -379,42 +380,14 @@ def _compute_simulation(
 
     Companion to :func:`_prepare_simulation`; reading and parsing happen
     there, size checks and evolution here, so an output conflict can be
-    refused between the two without running a simulation.
+    refused between the two without running a simulation. The computation
+    itself lives in :mod:`quantum_circuit.core`; this adapter only maps the
+    core's domain error onto the command-line error line and exit code.
     """
-    if noise_model is None:
-        state = simulate_state_vector(program)
-        counts = sample_counts(program, state, shots, seed)
-        result: dict[str, object] = {
-            "schema_version": 1,
-            "shots": shots,
-            "seed": seed,
-            "num_qubits": program.num_qubits,
-            "num_clbits": program.num_clbits,
-            "counts": counts,
-        }
-    else:
-        if program.num_qubits > MAX_NOISE_QUBITS:
-            return (
-                None,
-                _error_payload(
-                    "simulation_error",
-                    f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
-                    f"got {program.num_qubits}",
-                ),
-                3,
-            )
-        probabilities = simulate_density_matrix(program, noise_model)
-        counts = sample_counts_from_probabilities(program, probabilities, shots, seed)
-        result = {
-            "schema_version": 2,
-            "shots": shots,
-            "seed": seed,
-            "num_qubits": program.num_qubits,
-            "num_clbits": program.num_clbits,
-            "noise_model": noise_model,
-            "counts": counts,
-        }
-    return result, None, 0
+    try:
+        return sample_result(program, noise_model, shots, seed), None, 0
+    except SimulationError as exc:
+        return None, _error_payload("simulation_error", str(exc)), 3
 
 
 def _simulate(
@@ -443,64 +416,6 @@ def _simulate(
 
 # --------------------------------------------------------------- probabilities
 
-# Probabilities are reported in full; entries this close to 0 are omitted
-# and entries this close to 1 are reported as exactly 1. Reported values
-# sum to within 1e-12 of 1.
-_PROBABILITY_ZERO_TOLERANCE = 1e-15
-_PROBABILITY_ONE_TOLERANCE = 1e-15
-
-
-def _snap_probability(value: float) -> float | None:
-    """Snap one probability for deterministic output.
-
-    Returns ``None`` when the entry is omitted (magnitude at most
-    ``1e-15``), ``1.0`` when it is within ``1e-15`` of 1, and otherwise a
-    finite ``float`` clamped to ``(0, 1)`` so simulation round-off can
-    never produce an out-of-range value.
-    """
-    if abs(value) <= _PROBABILITY_ZERO_TOLERANCE:
-        return None
-    if abs(1.0 - value) <= _PROBABILITY_ONE_TOLERANCE:
-        return 1.0
-    return min(1.0, max(0.0, float(value)))
-
-
-def _probability_payload(
-    program: Program,
-    basis_probabilities: list[float],
-    noise_model: dict[str, float] | None,
-) -> dict[str, object]:
-    """Build the deterministic ``probabilities`` success payload.
-
-    The aggregated classical distribution is renormalized by its total
-    first, mirroring the normalization the sampling path applies to basis
-    probabilities, so simulation round-off (notably density-matrix drift)
-    cannot move the reported sum away from 1.
-    """
-    aggregated = measurement_probabilities(program, basis_probabilities)
-    total = math.fsum(aggregated.values())
-    probabilities: dict[str, float] = {}
-    for key, value in aggregated.items():
-        normalized = value / total if total else value
-        snapped = _snap_probability(normalized)
-        if snapped is not None:
-            probabilities[key] = snapped
-
-    if noise_model is None:
-        return {
-            "schema_version": 1,
-            "num_qubits": program.num_qubits,
-            "num_clbits": program.num_clbits,
-            "probabilities": probabilities,
-        }
-    return {
-        "schema_version": 2,
-        "num_qubits": program.num_qubits,
-        "num_clbits": program.num_clbits,
-        "noise_model": noise_model,
-        "probabilities": probabilities,
-    }
-
 
 def _probabilities(
     source_arg: str, noise_model_arg: str | None, ctx: _RunContext | None = None
@@ -515,22 +430,11 @@ def _probabilities(
     if ctx is not None and (code := _guard_output_conflict(ctx)) is not None:
         return code
 
-    if noise_model is None:
-        # Register sizes are already capped at 20 by the parser, matching
-        # the state-vector limit enforced for ``simulate``.
-        state = simulate_state_vector(program)
-        basis_probabilities = [abs(amplitude) ** 2 for amplitude in state]
-    else:
-        if program.num_qubits > MAX_NOISE_QUBITS:
-            _emit_error(
-                "simulation_error",
-                f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
-                f"got {program.num_qubits}",
-            )
-            return 3
-        basis_probabilities = simulate_density_matrix(program, noise_model)
-
-    result = _probability_payload(program, basis_probabilities, noise_model)
+    try:
+        result = probabilities_result(program, noise_model)
+    except SimulationError as exc:
+        _emit_error("simulation_error", str(exc))
+        return 3
     return _finish(ctx, result, 0)
 
 
@@ -683,30 +587,21 @@ def _verify_samples(
     if ctx is not None and (code := _guard_output_conflict(ctx)) is not None:
         return code
 
-    if noise_model is None:
-        # Register sizes are already capped at 20 by the parser, matching
-        # the state-vector limit enforced for ``simulate``.
-        state = simulate_state_vector(program)
-        basis_probabilities = [abs(amplitude) ** 2 for amplitude in state]
-    else:
-        if program.num_qubits > MAX_NOISE_QUBITS:
-            _emit_error(
-                "simulation_error",
-                f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
-                f"got {program.num_qubits}",
-            )
-            return 3
-        basis_probabilities = simulate_density_matrix(program, noise_model)
+    try:
+        basis = basis_probabilities(program, noise_model)
+    except SimulationError as exc:
+        _emit_error("simulation_error", str(exc))
+        return 3
 
     # Expected probabilities follow the exact ``probabilities`` convention
     # (aggregation, renormalization, near-zero/near-one snapping).
-    expected = _probability_payload(program, basis_probabilities, noise_model)["probabilities"]
+    expected = probability_payload(program, basis, noise_model)["probabilities"]
     assert isinstance(expected, dict)
 
     shots = sum(counts.values())
     observed: dict[str, float] = {}
     for key in sorted(counts):
-        snapped = _snap_probability(counts[key] / shots)
+        snapped = snap_probability(counts[key] / shots)
         if snapped is not None:
             observed[key] = snapped
 
