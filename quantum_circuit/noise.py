@@ -286,13 +286,13 @@ _CHANNELS = {
 }
 
 
-def simulate_density_matrix(program: Program, noise: dict[str, float]) -> list[float]:
-    """Evolve the density matrix under all gates and noise channels.
+def evolve_density_matrix(program: Program, noise: dict[str, float]) -> list[list[complex]]:
+    """Evolve and return the full final density matrix (row major).
 
-    Returns the diagonal of the final density matrix (measurement
-    probabilities per basis state). Measurements do not collapse the state,
-    matching the state-vector path. Noise evolution is deterministic and
-    consumes no randomness.
+    This is the same gate/noise evolution as :func:`simulate_density_matrix`
+    but returns the complete matrix rather than only its diagonal. Noise
+    evolution is deterministic and consumes no randomness; measurements do
+    not collapse the state, matching the state-vector path.
     """
     n = program.num_qubits
     size = 1 << n
@@ -319,4 +319,16 @@ def simulate_density_matrix(program: Program, noise: dict[str, float]) -> list[f
                 if probability:
                     _CHANNELS[channel](rho, qubit, size, probability)
 
-    return [rho[i][i].real for i in range(size)]
+    return rho
+
+
+def simulate_density_matrix(program: Program, noise: dict[str, float]) -> list[float]:
+    """Evolve the density matrix under all gates and noise channels.
+
+    Returns the diagonal of the final density matrix (measurement
+    probabilities per basis state). Measurements do not collapse the state,
+    matching the state-vector path. Noise evolution is deterministic and
+    consumes no randomness.
+    """
+    rho = evolve_density_matrix(program, noise)
+    return [row[i].real for i, row in enumerate(rho)]

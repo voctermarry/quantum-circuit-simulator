@@ -2,7 +2,7 @@
 
 本项目是「量子线路仿真与验证平台」的代码仓库，用于逐步实现该方向的线路构建、状态仿真与结果验证能力。
 
-当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、输出末态精确测量概率（不采样）的 `probabilities` 入口、按清单批量执行独立仿真的 `batch-simulate` 入口、按清单重跑并与历史批量结果对账的 `reconcile` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路末态并量化单量子位纠缠的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
+当前支持一个 OpenQASM 2.0 子集的状态向量仿真入口 `simulate`、输出末态精确测量概率（不采样）的 `probabilities` 入口、按清单批量执行独立仿真的 `batch-simulate` 入口、按清单重跑并与历史批量结果对账的 `reconcile` 入口、比较两份线路是否等价的 `equivalent` 入口、把线路化简为确定规范结果的 `optimize` 入口、比较两份线路（可单侧或双侧带噪）末态并量化单量子位熵的 `state-metrics` 入口，以及只解析分析、静态预估线路规模与可执行性的 `estimate` 入口。
 
 ## 环境与安装
 
@@ -176,24 +176,36 @@ quantum-circuit-simulator equivalent LEFT RIGHT [--output PATH]
 ### state-metrics 子命令
 
 ```bash
-quantum-circuit-simulator state-metrics LEFT RIGHT [--output PATH]
+quantum-circuit-simulator state-metrics LEFT RIGHT [--left-noise-model PATH] [--right-noise-model PATH] [--output PATH]
 ```
 
-- `LEFT`、`RIGHT`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取，但两侧不能同时为 `-`（此时不读取标准输入）。
-- 两份无噪声线路各自从全零初态演化（忽略末尾测量，不要求测量布局一致），比较所得末态并量化每个量子位与其余系统的纠缠；沿用现有解析、门语义与寄存器上限（最多 20 个量子位）。
+- `LEFT`、`RIGHT`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取。
+- `--left-noise-model` / `--right-noise-model`：可选的 UTF-8 JSON 噪声模型文件（格式见上文“噪声模型”一节，`-` 表示从标准输入读取）。四个输入（左右源文件、左右模型）至多一个可为 `-`，冲突时不读取标准输入，返回 `metrics_error`、退出码 2。
+- 两份线路各自从全零初态演化，忽略末尾测量，不要求测量布局一致。提供噪声模型的一侧按上文密度矩阵语义演化完整密度矩阵（沿用四类通道、规范化顺序与逐门施噪）；省略模型的一侧仍按纯态状态向量演化。
+- 量子位上限：带噪侧最多 10 个量子位，超限返回带 `input`（`left` 或 `right`）的 `simulation_error`、退出码 3；无噪侧仍保留 20 位上限。
+- 校验顺序为左源、左模型、右源、右模型，只报告首个问题。模型文件不可读为 `io_error`、退出码 1；UTF-8 或内容不合规为 `noise_model_error`、退出码 2；二者均带 `input` 标明所属侧。
 
-成功时 stdout 输出单行 JSON，字段顺序固定为 `schema_version`、`left_num_qubits`、`right_num_qubits`、`reason`、`fidelity`、`left_single_qubit_entropy`、`right_single_qubit_entropy`，其中 `schema_version` 为 1：
+**两侧均不提供噪声模型时**输出 `schema_version` 1，与历史命令逐字节兼容（成功 JSON 字段顺序固定为 `schema_version`、`left_num_qubits`、`right_num_qubits`、`reason`、`fidelity`、`left_single_qubit_entropy`、`right_single_qubit_entropy`）：
 
 ```json
 {"schema_version": 1, "left_num_qubits": 2, "right_num_qubits": 2, "reason": "compared", "fidelity": 1.0, "left_single_qubit_entropy": [1.0, 1.0], "right_single_qubit_entropy": [1.0, 1.0]}
 ```
 
-- `reason`：量子位数相同时为 `compared`，否则为 `qubit_count_mismatch`。
-- `fidelity`：两侧归一化末态内积的模平方；量子位数不同时为 `null`。
-- `left_single_qubit_entropy` / `right_single_qubit_entropy`：按量子位下标升序，每项为该位约化密度矩阵以 2 为底的冯诺依曼熵（零本征值不贡献）；乘积态为 0，Bell 态的两个量子位均为 1。量子位数不同时仍分别计算两侧熵数组。
-- 数值限制在定义域内：绝对值不超过 `1e-15` 时输出 `0`，与 1 的差不超过 `1e-15` 时输出 `1`，不会出现 NaN、Infinity 或负零；相同输入重复调用产生字节一致的 JSON。
+**任一侧提供噪声模型时**输出 `schema_version` 2，字段顺序固定为 `schema_version`、`left_num_qubits`、`right_num_qubits`、`reason`、`left_noise_model`、`right_noise_model`、`fidelity`、`left_purity`、`right_purity`、`left_single_qubit_entropy`、`right_single_qubit_entropy`：
 
-失败时（退出码非 0）stdout 为空，stderr 输出单行 JSON，错误对象带 `input` 字段标明出错的一侧（`left` 或 `right`）；两侧都有问题时按 LEFT、RIGHT 顺序报告首个错误。
+```json
+{"schema_version": 2, "left_num_qubits": 2, "right_num_qubits": 2, "reason": "compared", "left_noise_model": {"depolarizing": 0.1}, "right_noise_model": null, "fidelity": 0.047499999999999994, "left_purity": 0.6797454999999999, "right_purity": 1.0, "left_single_qubit_entropy": [1.0, 1.0], "right_single_qubit_entropy": [0.0, 0.0]}
+```
+
+- `reason`：量子位数相同时为 `compared`，否则为 `qubit_count_mismatch`。
+- `left_noise_model` / `right_noise_model`：对应侧规范化后的噪声模型（通道按固定顺序排列）；该侧未提供模型时为 `null`。
+- `fidelity`：平方 Uhlmann 保真度 `(Tr √(√ρ·σ·√ρ))²`；两侧纯态时即归一化内积模平方（与 schema 1 定义一致），仅一侧带噪时为 `⟨ψ|ρ|ψ⟩`；量子位数不同时为 `null`。
+- `left_purity` / `right_purity`：各自（归一化后）密度矩阵的纯度 `Tr(ρ²)`；纯态侧恒为 1。
+- `left_single_qubit_entropy` / `right_single_qubit_entropy`：按量子位下标升序，每项为该位约化密度矩阵以 2 为底的冯诺依曼熵（零本征值不贡献）；纯态侧量化纠缠，带噪侧还包含混合熵。量子位数不同时仍分别计算两侧熵数组与纯度。
+- 数值均为有限数且位于 0 到 1：绝对值不超过 `1e-15` 时输出 `0`，与 1 的差不超过 `1e-15` 时输出 `1`，不会出现 NaN、Infinity 或负零；相同输入重复调用产生字节一致的 JSON。
+
+失败时（退出码非 0）stdout 为空，stderr 输出单行 JSON，源文件错误沿用现有语义；带所属侧的错误通过 `input` 字段标明（`left` 或 `right`）；多个输入都有问题时按左源、左模型、右源、右模型顺序报告首个错误。
+
 
 ### optimize 子命令
 
@@ -294,7 +306,7 @@ probs = circuit.probabilities()   # 与 probabilities 命令的 JSON 对象一�
 - 除路径冲突外，命令先按原规则完成参数、输入、解析、验证与计算；任何既有失败都不会创建、截断或替换目标文件。只有在报告已经生成后才尝试提交导出。
 - 为避免一次导出破坏可复现输入，目标路径经绝对化和规范化后，不得与本次命令读取的任何非标准输入文件相同。受保护的输入包括：
   - 直接线路（`simulate`/`probabilities`/`optimize`/`estimate` 的 `SOURCE`，`equivalent`/`state-metrics` 的 `LEFT`、`RIGHT`）；
-  - 直接噪声模型（`--noise-model`）；
+  - 直接噪声模型（`simulate`/`probabilities` 的 `--noise-model`，`state-metrics` 的 `--left-noise-model`、`--right-noise-model`）；
   - 批量清单与 `reconcile` 基线；
   - 有效清单内引用的线路与噪声模型（即使该文件当前缺失或不可读，路径仍受保护）。
 - 路径冲突在任何仿真或重跑任务执行之前检出：不运行仿真、不重跑任务、不修改文件，stderr 输出单行 `{"error":"output_error",...}`，退出码为 2。
@@ -326,9 +338,12 @@ probs = circuit.probabilities()   # 与 probabilities 命令的 JSON 对象一�
 | `equivalent` 两侧同时取 `-`（此时不读取标准输入） | 2 | `comparison_error` |
 | `equivalent` 任一侧词法/语法或语义错误 | 2 | `parse_error` / `validation_error`（带 `input`：`left`/`right`，按 LEFT、RIGHT 顺序报告首个错误） |
 | `equivalent` 任一侧线路超过 8 个量子位 | 3 | `simulation_error`（带 `input`：`left`/`right`） |
-| `state-metrics` 任一侧文件不存在、不可读或不是合法 UTF-8 | 1 | `io_error`（带 `input`：`left`/`right`） |
-| `state-metrics` 两侧同时取 `-`（此时不读取标准输入） | 2 | `metrics_error` |
-| `state-metrics` 任一侧词法/语法或语义错误（含寄存器大小越限） | 2 | `parse_error` / `validation_error`（带 `input`：`left`/`right`，按 LEFT、RIGHT 顺序报告首个错误） |
+| `state-metrics` 任一侧源文件不存在、不可读或不是合法 UTF-8，或噪声模型文件不存在、不可读 | 1 | `io_error`（带 `input`：`left`/`right`） |
+| `state-metrics` 四个输入（左右源、左右模型）中两个及以上取 `-`（此时不读取标准输入） | 2 | `metrics_error` |
+| `state-metrics` 任一侧源文件词法/语法或语义错误（含无噪侧寄存器大小越限） | 2 | `parse_error` / `validation_error`（带 `input`：`left`/`right`） |
+| `state-metrics` 噪声模型不是合法 UTF-8 或内容不合规（非法 JSON、非对象、空对象、未知键、重复键、概率非 0 到 1 的有限数字） | 2 | `noise_model_error`（带 `input`：`left`/`right`） |
+| `state-metrics` 校验顺序与首个问题 | — | 按左源、左模型、右源、右模型顺序报告首个错误 |
+| `state-metrics` 带噪侧超过 10 个量子位 | 3 | `simulation_error`（带 `input`：`left`/`right`）；无噪侧仍沿用 20 位上限 |
 | `optimize` 的 SOURCE 不存在、不可读或不是合法 UTF-8 | 1 | `io_error` |
 | `optimize` 词法/语法或语义错误（带源码位置） | 2 | `parse_error` / `validation_error` |
 | `estimate` 的 SOURCE 不存在、不可读或不是合法 UTF-8 | 1 | `io_error` |
@@ -346,4 +361,4 @@ probs = circuit.probabilities()   # 与 probabilities 命令的 JSON 对象一�
 ## 限制
 
 - 仅支持 OpenQASM 2.0 的上述子集：`x`、`h`、`cx`、`cz` 与参数化门 `rx`、`ry`、`rz`、`crx`、`cry`、`crz`，以及按位测量，不支持条件执行或多寄存器。
-- 状态向量随量子位数指数增长，寄存器大小上限为 20；密度矩阵噪声仿真上限为 10 个量子位；`equivalent` 稠密酉矩阵比较上限为 8 个量子位；`state-metrics` 基于状态向量，沿用 20 个量子位的寄存器上限。
+- 状态向量随量子位数指数增长，寄存器大小上限为 20；密度矩阵噪声仿真上限为 10 个量子位；`equivalent` 稠密酉矩阵比较上限为 8 个量子位；`state-metrics` 无噪侧沿用 20 个量子位上限，提供噪声模型的一侧按密度矩阵演化、上限为 10 个量子位。
