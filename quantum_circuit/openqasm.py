@@ -8,8 +8,15 @@ Supported subset::
     creg name[positive-size];
     x qubit;
     h qubit;
+    y qubit;
+    z qubit;
+    s qubit;
+    sdg qubit;
+    t qubit;
+    tdg qubit;
     cx qubit, qubit;
     cz qubit, qubit;
+    swap qubit, qubit;
     rx(angle) qubit;
     ry(angle) qubit;
     rz(angle) qubit;
@@ -64,9 +71,14 @@ class Token:
 
 
 _KEYWORDS = {"OPENQASM", "include", "qreg", "creg", "measure"}
-_BUILTIN_GATES = {"x", "h", "cx", "cz", "rx", "ry", "rz", "crx", "cry", "crz"}
+_BUILTIN_GATES = {
+    "x", "h", "y", "z", "s", "sdg", "t", "tdg",
+    "cx", "cz", "swap",
+    "rx", "ry", "rz", "crx", "cry", "crz",
+}
 _PARAMETERIZED_GATES = {"rx", "ry", "rz"}
 _CONTROLLED_GATES = {"cx", "cz"}
+_TWO_QUBIT_GATES = {"swap"}
 _CONTROLLED_PARAMETERIZED_GATES = {"crx", "cry", "crz"}
 
 # A state vector has 2**n amplitudes; larger registers cannot be simulated
@@ -180,7 +192,8 @@ def tokenize(source: str) -> list[Token]:
 class Operation:
     """A validated gate application or measurement."""
 
-    kind: str  # 'x', 'h', 'cx', 'cz', 'rx', 'ry', 'rz', 'crx', 'cry', 'crz' or 'measure'
+    kind: str  # 'x', 'h', 'y', 'z', 's', 'sdg', 't', 'tdg', 'cx', 'cz', 'swap',
+    # 'rx', 'ry', 'rz', 'crx', 'cry', 'crz' or 'measure'
     targets: tuple[int, ...]  # qubit indices; measure appends the cbit index
     params: tuple[float, ...] = ()  # gate angles in radians (rx/ry/rz/crx/cry/crz only)
 
@@ -490,6 +503,18 @@ def parse(source: str) -> Program:
                         tgt_name_tok.column,
                     )
                 operations.append(Operation(gate_name, (ctrl, tgt)))
+            elif gate_name in _TWO_QUBIT_GATES:
+                first, _, _ = parse_index("q")
+                expect(",")
+                second, second_name_tok, _ = parse_index("q")
+                expect(";")
+                if first == second:
+                    raise ValidationError(
+                        f"{gate_name} operands must be different qubits",
+                        second_name_tok.line,
+                        second_name_tok.column,
+                    )
+                operations.append(Operation(gate_name, (first, second)))
             elif gate_name in _CONTROLLED_PARAMETERIZED_GATES:
                 expect("(")
                 angle = parse_angle()

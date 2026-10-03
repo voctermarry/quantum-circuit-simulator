@@ -12,8 +12,8 @@ up to four channel keys (probabilities in ``[0, 1]``):
 
 After every quantum gate, each configured channel is applied to every qubit
 the gate touched. Qubits of a two-qubit gate (``cx``, ``cz``, ``crx``,
-``cry``, ``crz``) are processed in ascending index order; channels on one
-qubit are applied in :data:`CHANNEL_ORDER` order.
+``cry``, ``crz``, ``swap``) are processed in ascending index order; channels
+on one qubit are applied in :data:`CHANNEL_ORDER` order.
 """
 
 from __future__ import annotations
@@ -120,6 +120,18 @@ def _gate_matrix(kind: str, params: tuple[float, ...]) -> tuple[complex, complex
         return (0j, 1 + 0j, 1 + 0j, 0j)
     if kind == "h":
         return (_SQRT1_2, _SQRT1_2, _SQRT1_2, -_SQRT1_2)
+    if kind == "y":
+        return (0j, -1j, 1j, 0j)
+    if kind == "z":
+        return (1 + 0j, 0j, 0j, -1 + 0j)
+    if kind == "s":
+        return (1 + 0j, 0j, 0j, 1j)
+    if kind == "sdg":
+        return (1 + 0j, 0j, 0j, -1j)
+    if kind == "t":
+        return (1 + 0j, 0j, 0j, cmath.exp(0.25j * math.pi))
+    if kind == "tdg":
+        return (1 + 0j, 0j, 0j, cmath.exp(-0.25j * math.pi))
     theta = params[0]
     c = math.cos(theta / 2)
     s = math.sin(theta / 2)
@@ -168,6 +180,20 @@ def _apply_cx(rho: list[list[complex]], control: int, target: int, size: int) ->
         rho[i], rho[j] = rho[j], rho[i]
     for i in swapped:
         j = i | tbit
+        for row in rho:
+            row[i], row[j] = row[j], row[i]
+
+
+def _apply_swap(rho: list[list[complex]], first: int, second: int, size: int) -> None:
+    """Apply the swap basis permutation to both axes of the density matrix."""
+    first_bit = 1 << first
+    second_bit = 1 << second
+    swapped = [i for i in range(size) if (i & first_bit) and not (i & second_bit)]
+    for i in swapped:
+        j = (i ^ first_bit) | second_bit
+        rho[i], rho[j] = rho[j], rho[i]
+    for i in swapped:
+        j = (i ^ first_bit) | second_bit
         for row in rho:
             row[i], row[j] = row[j], row[i]
 
@@ -304,6 +330,8 @@ def evolve_density_matrix(program: Program, noise: dict[str, float]) -> list[lis
             continue
         if op.kind == "cx":
             _apply_cx(rho, op.targets[0], op.targets[1], size)
+        elif op.kind == "swap":
+            _apply_swap(rho, op.targets[0], op.targets[1], size)
         elif op.kind == "cz":
             _apply_controlled(
                 rho, op.targets[0], op.targets[1], size, (1 + 0j, 0j, 0j, -1 + 0j)

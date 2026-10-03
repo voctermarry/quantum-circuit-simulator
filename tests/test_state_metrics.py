@@ -234,7 +234,7 @@ def test_parse_error_reports_side(write_qasm, capsys):
 
 
 def test_validation_error_reports_side(write_qasm, capsys):
-    left = write_qasm("qreg q[1];\ncreg c[1];\ny q[0];\n", "left.qasm")
+    left = write_qasm("qreg q[1];\ncreg c[1];\nu q[0];\n", "left.qasm")
     right = write_qasm("qreg q[1];\ncreg c[1];\nh q[0];\n", "right.qasm")
     rc = cli.main(["state-metrics", left, right])
     captured = capsys.readouterr()

@@ -32,6 +32,45 @@ def _pauli_x(state: list[complex], qubit: int, num_qubits: int) -> None:
             state[low], state[high] = state[high], state[low]
 
 
+def _pauli_y(state: list[complex], qubit: int, num_qubits: int) -> None:
+    bit = 1 << qubit
+    step = bit << 1
+    for base in range(0, 1 << num_qubits, step):
+        for low in range(base, base + bit):
+            high = low | bit
+            a = state[low]
+            b = state[high]
+            state[low] = -1j * b
+            state[high] = 1j * a
+
+
+# Phase gates diag(1, phase): z, s/sdg (diag(1, +-i)) and t/tdg
+# (phase exp(+-i*pi/4)).
+_PHASE_GATES = {
+    "z": -1 + 0j,
+    "s": 1j,
+    "sdg": -1j,
+    "t": cmath.exp(0.25j * math.pi),
+    "tdg": cmath.exp(-0.25j * math.pi),
+}
+
+
+def _phase(state: list[complex], qubit: int, num_qubits: int, factor: complex) -> None:
+    bit = 1 << qubit
+    for index in range(1 << num_qubits):
+        if index & bit:
+            state[index] = factor * state[index]
+
+
+def _swap(state: list[complex], first: int, second: int, num_qubits: int) -> None:
+    first_bit = 1 << first
+    second_bit = 1 << second
+    for index in range(1 << num_qubits):
+        if (index & first_bit) and not (index & second_bit):
+            other = (index ^ first_bit) | second_bit
+            state[index], state[other] = state[other], state[index]
+
+
 def _controlled_x(state: list[complex], control: int, target: int, num_qubits: int) -> None:
     cbit = 1 << control
     tbit = 1 << target
@@ -122,6 +161,12 @@ def _apply_gate(state: list[complex], op: Operation, num_qubits: int) -> None:
         _pauli_x(state, op.targets[0], num_qubits)
     elif op.kind == "h":
         _hadamard(state, op.targets[0], num_qubits)
+    elif op.kind == "y":
+        _pauli_y(state, op.targets[0], num_qubits)
+    elif op.kind in _PHASE_GATES:
+        _phase(state, op.targets[0], num_qubits, _PHASE_GATES[op.kind])
+    elif op.kind == "swap":
+        _swap(state, op.targets[0], op.targets[1], num_qubits)
     elif op.kind == "cx":
         _controlled_x(state, op.targets[0], op.targets[1], num_qubits)
     elif op.kind == "cz":
