@@ -162,8 +162,8 @@ def test_classical_register_required_as_measure_target():
 
 
 def test_unsupported_gate_is_validation_error():
-    exc = _validation("qreg q[1];\ncreg c[1];\nz q[0];\n")
-    assert "z" in exc.message
+    exc = _validation("qreg q[1];\ncreg c[1];\nw q[0];\n")
+    assert "w" in exc.message
 
 
 def test_qubit_measured_twice_rejected():

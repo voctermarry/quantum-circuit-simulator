@@ -8,8 +8,15 @@ Supported subset::
     creg name[positive-size];
     x qubit;
     h qubit;
+    y qubit;
+    z qubit;
+    s qubit;
+    sdg qubit;
+    t qubit;
+    tdg qubit;
     cx qubit, qubit;
     cz qubit, qubit;
+    swap qubit, qubit;
     rx(angle) qubit;
     ry(angle) qubit;
     rz(angle) qubit;
@@ -64,9 +71,15 @@ class Token:
 
 
 _KEYWORDS = {"OPENQASM", "include", "qreg", "creg", "measure"}
-_BUILTIN_GATES = {"x", "h", "cx", "cz", "rx", "ry", "rz", "crx", "cry", "crz"}
+_SINGLE_QUBIT_GATES = {"x", "h", "y", "z", "s", "sdg", "t", "tdg"}
+_TWO_QUBIT_GATES = {"cx", "cz", "swap"}
+_BUILTIN_GATES = (
+    _SINGLE_QUBIT_GATES | _TWO_QUBIT_GATES
+    | {"rx", "ry", "rz", "crx", "cry", "crz"}
+)
 _PARAMETERIZED_GATES = {"rx", "ry", "rz"}
 _CONTROLLED_GATES = {"cx", "cz"}
+_TWO_QUBIT_STATIC_GATES = _CONTROLLED_GATES | {"swap"}
 _CONTROLLED_PARAMETERIZED_GATES = {"crx", "cry", "crz"}
 
 # A state vector has 2**n amplitudes; larger registers cannot be simulated
@@ -180,7 +193,9 @@ def tokenize(source: str) -> list[Token]:
 class Operation:
     """A validated gate application or measurement."""
 
-    kind: str  # 'x', 'h', 'cx', 'cz', 'rx', 'ry', 'rz', 'crx', 'cry', 'crz' or 'measure'
+    kind: str
+    # 'x', 'h', 'y', 'z', 's', 'sdg', 't', 'tdg', 'cx', 'cz', 'swap',
+    # 'rx', 'ry', 'rz', 'crx', 'cry', 'crz' or 'measure'
     targets: tuple[int, ...]  # qubit indices; measure appends the cbit index
     params: tuple[float, ...] = ()  # gate angles in radians (rx/ry/rz/crx/cry/crz only)
 
@@ -478,18 +493,19 @@ def parse(source: str) -> Program:
                     tok.column,
                 )
             advance()
-            if gate_name in _CONTROLLED_GATES:
-                ctrl, _, _ = parse_index("q")
+            if gate_name in _TWO_QUBIT_STATIC_GATES:
+                first, _, _ = parse_index("q")
                 expect(",")
-                tgt, tgt_name_tok, _ = parse_index("q")
+                second, second_name_tok, _ = parse_index("q")
                 expect(";")
-                if ctrl == tgt:
+                if first == second:
+                    noun = "operands" if gate_name == "swap" else "control and target"
                     raise ValidationError(
-                        f"{gate_name} control and target must be different qubits",
-                        tgt_name_tok.line,
-                        tgt_name_tok.column,
+                        f"{gate_name} {noun} must be different qubits",
+                        second_name_tok.line,
+                        second_name_tok.column,
                     )
-                operations.append(Operation(gate_name, (ctrl, tgt)))
+                operations.append(Operation(gate_name, (first, second)))
             elif gate_name in _CONTROLLED_PARAMETERIZED_GATES:
                 expect("(")
                 angle = parse_angle()

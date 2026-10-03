@@ -4,9 +4,11 @@ The optimizer rewrites the pre-measurement gate sequence into a canonical
 form while preserving the circuit's transformation up to a global phase and
 keeping the measurement layout (qubit-to-clbit mapping) intact:
 
-* adjacent ``x``/``x``, ``h``/``h`` pairs and ``cx``/``cz`` pairs with
-  identical control and target cancel ("adjacent" allows intervening gates
-  on disjoint qubits);
+* adjacent ``x``/``x``, ``h``/``h``, ``y``/``y``, ``z``/``z`` pairs and
+  ``cx``/``cz``/``swap`` pairs with identical operands cancel ("adjacent"
+  allows intervening gates on disjoint qubits);
+* adjacent inverse phase pairs ``s``/``sdg`` and ``t``/``tdg`` (in either
+  order) cancel the same way;
 * consecutive same-axis ``rx``/``ry``/``rz`` rotations on one qubit merge
   into a single rotation, as do consecutive same-axis ``crx``/``cry``/``crz``
   rotations with identical control and target;
@@ -98,7 +100,7 @@ def _format_angle(angle: float) -> str:
 
 
 def _gate_from_operation(op: Operation) -> Gate:
-    if op.kind in ("cx", "cz"):
+    if op.kind in ("cx", "cz", "swap"):
         return Gate(op.kind, (op.targets[0], op.targets[1]))
     if op.kind in _ROTATIONS:
         return Gate(op.kind, (op.targets[0],), normalize_angle(op.params[0]))
@@ -122,10 +124,14 @@ def _cancels(first: Gate, second: Gate) -> bool:
     """True when *second* immediately follows *first* and both vanish."""
     if first.qubits != second.qubits:
         return False
-    if first.kind in ("x", "h"):
+    if first.kind in ("x", "h", "y", "z"):
         return first.kind == second.kind
-    if first.kind in ("cx", "cz"):
+    if first.kind in ("cx", "cz", "swap"):
         return second.kind == first.kind
+    if {first.kind, second.kind} == {"s", "sdg"}:
+        return True
+    if {first.kind, second.kind} == {"t", "tdg"}:
+        return True
     return False
 
 
@@ -257,7 +263,7 @@ def canonical_gates(operations: tuple[Operation, ...]) -> tuple[tuple[Gate, ...]
 
 
 def _gate_line(gate: Gate) -> str:
-    if gate.kind in ("cx", "cz"):
+    if gate.kind in ("cx", "cz", "swap"):
         return f"{gate.kind} q[{gate.qubits[0]}],q[{gate.qubits[1]}];"
     if gate.kind in _ROTATIONS:
         assert gate.angle is not None

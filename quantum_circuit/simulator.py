@@ -32,6 +32,38 @@ def _pauli_x(state: list[complex], qubit: int, num_qubits: int) -> None:
             state[low], state[high] = state[high], state[low]
 
 
+def _pauli_y(state: list[complex], qubit: int, num_qubits: int) -> None:
+    # Y = [[0, -i], [i, 0]]: |0> -> i|1>, |1> -> -i|0>.
+    bit = 1 << qubit
+    step = bit << 1
+    for base in range(0, 1 << num_qubits, step):
+        for low in range(base, base + bit):
+            high = low | bit
+            a = state[low]
+            b = state[high]
+            state[low] = -1j * b
+            state[high] = 1j * a
+
+
+def _diagonal_phase(state: list[complex], qubit: int, num_qubits: int, factor: complex) -> None:
+    """Apply ``diag(1, factor)`` on *qubit* (z/s/sdg/t/tdg share this form)."""
+    bit = 1 << qubit
+    for index in range(1 << num_qubits):
+        if index & bit:
+            state[index] = factor * state[index]
+
+
+def _swap(state: list[complex], first: int, second: int, num_qubits: int) -> None:
+    abit = 1 << first
+    bbit = 1 << second
+    for index in range(1 << num_qubits):
+        # Each unordered pair is visited once: the state with first-bit 0
+        # and second-bit 1 is exchanged with first-bit 1, second-bit 0.
+        if not (index & abit) and (index & bbit):
+            other = (index | abit) & ~bbit
+            state[index], state[other] = state[other], state[index]
+
+
 def _controlled_x(state: list[complex], control: int, target: int, num_qubits: int) -> None:
     cbit = 1 << control
     tbit = 1 << target
@@ -120,8 +152,22 @@ def _apply_gate(state: list[complex], op: Operation, num_qubits: int) -> None:
     """Apply one (non-measurement) *op* to *state* in place."""
     if op.kind == "x":
         _pauli_x(state, op.targets[0], num_qubits)
+    elif op.kind == "y":
+        _pauli_y(state, op.targets[0], num_qubits)
+    elif op.kind == "z":
+        _diagonal_phase(state, op.targets[0], num_qubits, -1 + 0j)
+    elif op.kind == "s":
+        _diagonal_phase(state, op.targets[0], num_qubits, 1j)
+    elif op.kind == "sdg":
+        _diagonal_phase(state, op.targets[0], num_qubits, -1j)
+    elif op.kind == "t":
+        _diagonal_phase(state, op.targets[0], num_qubits, cmath.exp(0.25j * math.pi))
+    elif op.kind == "tdg":
+        _diagonal_phase(state, op.targets[0], num_qubits, cmath.exp(-0.25j * math.pi))
     elif op.kind == "h":
         _hadamard(state, op.targets[0], num_qubits)
+    elif op.kind == "swap":
+        _swap(state, op.targets[0], op.targets[1], num_qubits)
     elif op.kind == "cx":
         _controlled_x(state, op.targets[0], op.targets[1], num_qubits)
     elif op.kind == "cz":

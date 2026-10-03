@@ -63,7 +63,7 @@ quantum-circuit-simulator simulate SOURCE [--shots N] [--seed S] [--noise-model 
 - `bit_flip`：ρ → (1-p)ρ + pXρX。
 - `depolarizing`：ρ → (1-p)ρ + pI/2。
 
-每个量子门完成后，对该门涉及的量子位施加配置的通道；双量子位门（`cx`、`cz`、`crx`、`cry`、`crz`）的两位按下标升序处理，同一位固定按 `amplitude_damping`、`phase_damping`、`bit_flip`、`depolarizing` 的顺序处理。采样取最终密度矩阵的对角概率，噪声演化不消耗 seed。
+每个量子门完成后，对该门涉及的量子位施加配置的通道；双量子位门（`cx`、`cz`、`swap`、`crx`、`cry`、`crz`）的两位按下标升序处理，同一位固定按 `amplitude_damping`、`phase_damping`、`bit_flip`、`depolarizing` 的顺序处理。采样取最终密度矩阵的对角概率，噪声演化不消耗 seed。
 
 成功输出字段顺序为 `schema_version`、`shots`、`seed`、`num_qubits`、`num_clbits`、`noise_model`、`counts`，其中 `schema_version` 为 2；`noise_model` 按固定通道顺序仅回显已给概率，模型的空白与键顺序不影响输出。
 
@@ -223,7 +223,7 @@ quantum-circuit-simulator optimize SOURCE [--output PATH]
 - 门数只统计测量之前的量子门；`changed` 表示门序列（消去、合并、删除或重排）是否发生变化，仅角度按规范值重新打印不算变化。
 - 规范线路统一以 `q`、`c` 作为寄存器名，保留寄存器尺寸及量子位→经典位的测量映射；测量按（经典位下标、量子位下标）升序输出。
 - 化简规则（允许全局相位）：
-  - 同一依赖链上成对的 `x`、`h` 消去；控制位与目标位都相同的一对 `cx` 或 `cz` 消去。两门之间只隔着与所用量子位不相交的门时也视为相邻。
+  - 同一依赖链上成对的 `x`、`h`、`y`、`z` 消去；控制位与目标位都相同的一对 `cx`、`cz` 以及两个操作数相同的一对 `swap` 消去；同一量子位上相邻的逆相位门对 `s`/`sdg`、`t`/`tdg`（两种先后顺序均可）消去。两门之间只隔着与所用量子位不相交的门时也视为相邻。
   - 同一量子位、同一转轴的相邻 `rx`/`ry`/`rz` 合并；角度规范到 `(-pi, pi]`（`-pi` 写作 `pi`）；绝对值不超过 `1e-12` 的旋转删除；接近 `pi` 的 `rx`/`ry` 不替换为 `x`。
   - 控制位与目标位都相同、同一转轴的相邻 `crx`/`cry`/`crz` 合并；受控旋转角按 `4*pi` 周期规范到 `(-2*pi, 2*pi]`（`2*pi` 不是全局相位，予以保留）；规范后绝对值不超过 `1e-12` 的受控旋转删除。
   - 互不共享量子位的门按（最小量子位、最大量子位、门名、参数文本）稳定重排；其余门保留依赖顺序。化简与重排持续进行直到序列稳定，因此仅独立门书写顺序不同的输入产生字节一致的 `qasm`；对输出再次 optimize 得到相同结果。
@@ -238,14 +238,18 @@ quantum-circuit-simulator estimate SOURCE [--mode state-vector|density-matrix|un
 
 - `SOURCE`：UTF-8 编码的 OpenQASM 源文件路径；`-` 表示从标准输入读取。
 - `--mode`：预估规模所针对的模式，默认 `state-vector`。命令只解析、分析线路，不演化、不采样，也不分配指数规模的状态向量、密度矩阵或酉矩阵。
-- 成功时 stdout 输出单行 JSON，字段顺序固定为 `schema_version`、`mode`、`num_qubits`、`num_clbits`、`gate_count`、`measurement_count`、`gate_counts`、`circuit_depth`、`entry_count`、`complex_payload_bytes`、`supported`、`qubit_limit`。仅含 `x`、`h`、`cx`、`rx`、`ry`、`rz` 的线路输出 `schema_version` 为 1（与既有结果字节一致）；一旦出现 `cz`、`crx`、`cry`、`crz` 中任一门，`schema_version` 为 2：
+- 成功时 stdout 输出单行 JSON，字段顺序固定为 `schema_version`、`mode`、`num_qubits`、`num_clbits`、`gate_count`、`measurement_count`、`gate_counts`、`circuit_depth`、`entry_count`、`complex_payload_bytes`、`supported`、`qubit_limit`。仅含 `x`、`h`、`cx`、`rx`、`ry`、`rz` 的线路输出 `schema_version` 为 1（与既有结果字节一致）；一旦出现 `cz`、`crx`、`cry`、`crz` 中任一门（且不含下面的相位/交换门），`schema_version` 为 2；一旦出现 `y`、`z`、`s`、`sdg`、`t`、`tdg`、`swap` 中任一门，`schema_version` 为 3：
 
 ```json
 {"schema_version": 1, "mode": "state-vector", "num_qubits": 2, "num_clbits": 2, "gate_count": 2, "measurement_count": 2, "gate_counts": {"x": 0, "h": 1, "cx": 1, "rx": 0, "ry": 0, "rz": 0}, "circuit_depth": 2, "entry_count": 4, "complex_payload_bytes": 64, "supported": true, "qubit_limit": 20}
 ```
 
+```json
+{"schema_version": 3, "mode": "state-vector", "num_qubits": 2, "num_clbits": 2, "gate_count": 2, "measurement_count": 0, "gate_counts": {"x": 0, "h": 0, "cx": 0, "cz": 0, "rx": 0, "ry": 0, "rz": 0, "crx": 0, "cry": 0, "crz": 0, "y": 1, "z": 0, "s": 0, "sdg": 0, "t": 0, "tdg": 0, "swap": 1}, "circuit_depth": 2, "entry_count": 4, "complex_payload_bytes": 64, "supported": true, "qubit_limit": 20}
+```
+
 - `gate_count` 只统计测量之前的量子门；`measurement_count` 为测量条数。
-- `gate_counts`：`schema_version` 1 固定按 `x`、`h`、`cx`、`rx`、`ry`、`rz` 顺序给出六项计数；`schema_version` 2 固定按 `x`、`h`、`cx`、`cz`、`rx`、`ry`、`rz`、`crx`、`cry`、`crz` 顺序给出全部十项计数。
+- `gate_counts`：`schema_version` 1 固定按 `x`、`h`、`cx`、`rx`、`ry`、`rz` 顺序给出六项计数；`schema_version` 2 固定按 `x`、`h`、`cx`、`cz`、`rx`、`ry`、`rz`、`crx`、`cry`、`crz` 顺序给出全部十项计数；`schema_version` 3 在上述十项之后按 `y`、`z`、`s`、`sdg`、`t`、`tdg`、`swap` 的顺序追加七项计数。门数与深度口径不变。
 - `circuit_depth`：每个门的层数为其所涉量子位当前最大层数加一，按源码顺序处理，互不相交（不共享量子位）的门可同层；测量不计深度，没有量子门时为 0。
 - `entry_count`：`state-vector` 为 2 的量子位数次方，`density-matrix` 与 `unitary` 为 4 的量子位数次方；`complex_payload_bytes` 等于 `entry_count` 乘 16（每个复数两个 8 字节浮点）。
 - `qubit_limit` 三种模式分别为 20、10、8；未超限时 `supported` 为 `true`，否则为 `false`。超限仍返回估算结果（退出码 0），不启动实际计算。
@@ -260,8 +264,15 @@ qreg name[size];
 creg name[size];
 x q[i];
 h q[i];
+y q[i];
+z q[i];
+s q[i];
+sdg q[i];
+t q[i];
+tdg q[i];
 cx q[i], q[j];
 cz q[i], q[j];
+swap q[i], q[j];
 rx(angle) q[i];
 ry(angle) q[i];
 rz(angle) q[i];
@@ -274,7 +285,7 @@ measure q[i] -> c[k];
 - 必须以 `OPENQASM 2.0;` 和 `include "qelib1.inc";` 开头。
 - 恰好声明一个非空 `qreg` 和一个非空 `creg`；支持 `//` 行注释。
 - 门与测量只接受带常量下标的单个位；语句按源码顺序生效。
-- `rx`、`ry`、`rz` 与受控旋转门 `crx`、`cry`、`crz` 恰好接收一个以弧度表示的角参数；`cz` 在控制位与目标位都为 1 时引入负相位，受控旋转仅在控制位为 1 时对目标位施加对应旋转；控制位与目标位相同属于语义错误；角表达式支持十进制整数、实数（含科学计数法）、常量 `pi`、圆括号、一元 `+`/`-` 以及二元 `+`、`-`、`*`、`/`（乘除优先于加减，同级从左到右，括号优先）。
+- `rx`、`ry`、`rz` 与受控旋转门 `crx`、`cry`、`crz` 恰好接收一个以弧度表示的角参数；`y` 采用 Pauli-Y 变换（`[[0,-i],[i,0]]`），`z` 为 `diag(1,-1)`，`s`、`sdg` 分别为 `diag(1,i)`、`diag(1,-i)`，`t`、`tdg` 的 |1〉相位分别为 `exp(i*pi/4)` 及其共轭 `exp(-i*pi/4)`；`cz` 在控制位与目标位都为 1 时引入负相位，受控旋转仅在控制位为 1 时对目标位施加对应旋转；`swap` 交换两个量子位。控制位与目标位相同属于语义错误，`swap` 的两个操作数相同同样属于语义错误（带源码位置的 `validation_error`），操作数结构错误仍为带位置的 `parse_error`；角表达式支持十进制整数、实数（含科学计数法）、常量 `pi`、圆括号、一元 `+`/`-` 以及二元 `+`、`-`、`*`、`/`（乘除优先于加减，同级从左到右，括号优先）。
 - 测量只能出现在所有量子门之后，每个量子位、经典位最多参与一次测量。
 
 ### Python 线路 DSL
@@ -290,7 +301,7 @@ counts = circuit.sample()         # 与 simulate 命令的 JSON 对象一致的�
 probs = circuit.probabilities()   # 与 probabilities 命令的 JSON 对象一致的字典
 ```
 
-- `Circuit(num_qubits, num_clbits)`：寄存器尺寸为 1 至 20 的整数（拒绝布尔值）。链式方法 `x`、`h`、`cx`、`cz`、`rx`、`ry`、`rz`、`crx`、`cry`、`crz` 与逐位 `measure(qubit, clbit)` 按加入顺序追加操作并返回同一线路对象；旋转门签名为 `rx(angle, qubit)`、`crx(angle, control, target)`。
+- `Circuit(num_qubits, num_clbits)`：寄存器尺寸为 1 至 20 的整数（拒绝布尔值）。链式方法 `x`、`h`、`y`、`z`、`s`、`sdg`、`t`、`tdg`、`cx`、`cz`、`swap`、`rx`、`ry`、`rz`、`crx`、`cry`、`crz` 与逐位 `measure(qubit, clbit)` 按加入顺序追加操作并返回同一线路对象；旋转门签名为 `rx(angle, qubit)`、`crx(angle, control, target)`，`swap(first, second)` 两个操作数相同时抛出 `ValueError` 且线路保持不变。
 - 下标必须是非布尔整数且在对应寄存器范围内；受控门的控制位与目标位不得相同；角度只接受有限的整数或浮点数。每个量子位、经典位最多参与一次测量，测量开始后不能再添加量子门。类型不符抛出 `TypeError`，越界、非有限角度及语义冲突抛出 `ValueError`；失败的追加不改变线路。
 - `to_qasm()` 生成可被本仓库解析器接受的 OpenQASM 文本，角度使用可还原为同一浮点值的最短十进制表示（负零写作 `0`）；`Circuit.from_qasm(text)` 从文本创建线路，解析与语义错误继续抛出 `ParseError`/`ValidationError` 并保留行列位置。
 - `sample(shots=1024, seed=0, noise_model=None)` 与 `probabilities(noise_model=None)` 复用命令行的仿真与采样路径，返回字典与同一线路经 `simulate`/`probabilities` 命令得到的 JSON 对象字段与值完全一致（含默认参数、测量位序、无测量结果、噪声通道顺序与量子位上限）；调用不修改线路，相同参数的重复调用返回相等结果，且各次调用不共享随机状态。`noise_model` 直接接受映射，沿用四类通道与概率校验，非法模型抛出 `NoiseModelError`；`shots` 非正或非整数、`seed` 非整数分别抛出 `ValueError`/`TypeError`。
@@ -360,5 +371,5 @@ probs = circuit.probabilities()   # 与 probabilities 命令的 JSON 对象一�
 
 ## 限制
 
-- 仅支持 OpenQASM 2.0 的上述子集：`x`、`h`、`cx`、`cz` 与参数化门 `rx`、`ry`、`rz`、`crx`、`cry`、`crz`，以及按位测量，不支持条件执行或多寄存器。
+- 仅支持 OpenQASM 2.0 的上述子集：`x`、`h`、`y`、`z`、`s`、`sdg`、`t`、`tdg`、`cx`、`cz`、`swap` 与参数化门 `rx`、`ry`、`rz`、`crx`、`cry`、`crz`，以及按位测量，不支持条件执行或多寄存器。
 - 状态向量随量子位数指数增长，寄存器大小上限为 20；密度矩阵噪声仿真上限为 10 个量子位；`equivalent` 稠密酉矩阵比较上限为 8 个量子位；`state-metrics` 无噪侧沿用 20 个量子位上限，提供噪声模型的一侧按密度矩阵演化、上限为 10 个量子位。

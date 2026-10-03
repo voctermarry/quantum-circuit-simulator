@@ -76,7 +76,7 @@ def _operation_line(op: Operation) -> str:
     """Render one operation as an OpenQASM statement (register names q/c)."""
     if op.kind == "measure":
         return f"measure q[{op.targets[0]}] -> c[{op.targets[1]}];"
-    if op.kind in ("cx", "cz"):
+    if op.kind in ("cx", "cz", "swap"):
         return f"{op.kind} q[{op.targets[0]}],q[{op.targets[1]}];"
     if op.kind in ("rx", "ry", "rz"):
         return f"{op.kind}({_format_angle(op.params[0])}) q[{op.targets[0]}];"
@@ -156,6 +156,42 @@ class Circuit:
         self._check_gate_allowed("h")
         return self._append_gate(Operation("h", (target,)))
 
+    def y(self, qubit: int) -> Circuit:
+        """Append a Pauli-``y`` gate on *qubit*."""
+        target = self._qubit_index(qubit)
+        self._check_gate_allowed("y")
+        return self._append_gate(Operation("y", (target,)))
+
+    def z(self, qubit: int) -> Circuit:
+        """Append a Pauli-``z`` gate (``diag(1, -1)``) on *qubit*."""
+        target = self._qubit_index(qubit)
+        self._check_gate_allowed("z")
+        return self._append_gate(Operation("z", (target,)))
+
+    def s(self, qubit: int) -> Circuit:
+        """Append an ``s`` phase gate (``diag(1, i)``) on *qubit*."""
+        target = self._qubit_index(qubit)
+        self._check_gate_allowed("s")
+        return self._append_gate(Operation("s", (target,)))
+
+    def sdg(self, qubit: int) -> Circuit:
+        """Append an ``sdg`` gate (``diag(1, -i)``), the inverse of ``s``."""
+        target = self._qubit_index(qubit)
+        self._check_gate_allowed("sdg")
+        return self._append_gate(Operation("sdg", (target,)))
+
+    def t(self, qubit: int) -> Circuit:
+        """Append a ``t`` gate (phase ``exp(i*pi/4)``) on *qubit*."""
+        target = self._qubit_index(qubit)
+        self._check_gate_allowed("t")
+        return self._append_gate(Operation("t", (target,)))
+
+    def tdg(self, qubit: int) -> Circuit:
+        """Append a ``tdg`` gate, the conjugate (inverse) of ``t``."""
+        target = self._qubit_index(qubit)
+        self._check_gate_allowed("tdg")
+        return self._append_gate(Operation("tdg", (target,)))
+
     def cx(self, control: int, target: int) -> Circuit:
         """Append a ``cx`` gate from *control* to *target*."""
         ctrl = self._qubit_index(control)
@@ -173,6 +209,15 @@ class Circuit:
             raise ValueError("cz control and target must be different qubits")
         self._check_gate_allowed("cz")
         return self._append_gate(Operation("cz", (ctrl, tgt)))
+
+    def swap(self, first: int, second: int) -> Circuit:
+        """Append a ``swap`` gate exchanging *first* and *second*."""
+        one = self._qubit_index(first)
+        other = self._qubit_index(second)
+        if one == other:
+            raise ValueError("swap operands must be different qubits")
+        self._check_gate_allowed("swap")
+        return self._append_gate(Operation("swap", (one, other)))
 
     def _rotation(self, kind: str, angle: object, qubit: object) -> Circuit:
         theta = _check_angle(angle)
