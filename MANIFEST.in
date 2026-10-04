@@ -1,0 +1,9 @@
+include MANIFEST.in
+include README.md
+include pyproject.toml
+include _build/backend.py
+recursive-include quantum_circuit *.py
+prune tests
+prune build
+prune dist
+global-exclude __pycache__ *.py[co] .DS_Store

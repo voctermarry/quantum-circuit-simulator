@@ -18,6 +18,22 @@ python -m pip install -e .
 python -m pytest
 ```
 
+## 构建发行制品
+
+从干净源码快照构建 sdist 与纯 Python wheel（`py3-none-any`）：
+
+```bash
+python -m pip install build
+SOURCE_DATE_EPOCH=1700000000 python -m build
+```
+
+制品写入 `dist/`：sdist（`quantum-circuit-simulator-<版本>.tar.gz`，较新的 setuptools 按 PEP 625 写作 `quantum_circuit_simulator-<版本>.tar.gz`）与 `quantum_circuit_simulator-<版本>-py3-none-any.whl`，二者均使用 `pyproject.toml` 声明的项目名与 `quantum_circuit.__version__` 对应的版本号。wheel 只包含运行所需的 `quantum_circuit` 包文件与元数据，不含 `tests`、缓存、临时文件或本机绝对路径，也不引入任何运行时第三方依赖。
+
+- 给定完全相同的源码、Python 次版本与 `SOURCE_DATE_EPOCH`，连续构建得到的 sdist 与 wheel 分别字节一致；从 sdist 再构建出的 wheel 与直接构建的 wheel 一致。
+- 构建由树内后端 `_build/backend.py`（PEP 517，`backend-path`）执行：缺少 README、包目录或入口模块、元数据版本与包版本不一致、非 UTF-8 元数据、归档成员越出项目目录或重复时，构建以非零状态终止，且不在输出目录留下可安装制品。
+- 安装：`python -m pip install dist/quantum_circuit_simulator-<版本>-py3-none-any.whl`（需要 Python 3.11+）；卸载 `python -m pip uninstall quantum-circuit-simulator` 后不留控制台入口或包文件。
+
+
 ## 命令行入口
 
 安装后提供 `quantum-circuit-simulator` 命令：
