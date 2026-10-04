@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
+import sys
 
 import pytest
 
@@ -435,3 +437,220 @@ def test_noise_model_accepts_int_probabilities_and_canonical_order():
     result = circuit.sample(noise_model={"depolarizing": 0, "amplitude_damping": 1})
     assert list(result["noise_model"]) == ["amplitude_damping", "depolarizing"]
     assert result["noise_model"] == {"amplitude_damping": 1.0, "depolarizing": 0.0}
+
+
+# ------------------------------------------------------------- expectation
+
+
+def _observables():
+    return [
+        {"id": "zz", "operators": [{"qubit": 0, "pauli": "Z"}, {"qubit": 1, "pauli": "Z"}]},
+        {"id": "identity", "operators": []},
+        {"id": "x0", "operators": [{"qubit": 0, "pauli": "X"}]},
+    ]
+
+
+def _write_observables(tmp_path, observables, name="observables.json"):
+    path = tmp_path / name
+    path.write_text(
+        json.dumps({"schema_version": 1, "observables": observables}), encoding="utf-8"
+    )
+    return str(path)
+
+
+def test_expectation_matches_command(write_qasm, tmp_path, capsys):
+    circuit = _bell()
+    observables = _observables()
+    qasm_path = write_qasm(circuit.to_qasm().split(HEADER, 1)[1])
+    obs_path = _write_observables(tmp_path, observables)
+    expected = _run_cli(["expectation", qasm_path, obs_path], capsys)
+    result = circuit.expectation(observables)
+    assert result == expected
+    assert list(result) == list(expected)
+    assert [entry["id"] for entry in result["results"]] == ["zz", "identity", "x0"]
+    assert result["results"][0]["expectation"] == 1
+    assert result["results"][1]["expectation"] == 1
+    assert result["noise_model"] is None
+
+
+def test_expectation_with_noise_matches_command(write_qasm, write_model, tmp_path, capsys):
+    circuit = _bell()
+    observables = _observables()
+    model = {"depolarizing": 0.1, "amplitude_damping": 0.05}
+    qasm_path = write_qasm(circuit.to_qasm().split(HEADER, 1)[1])
+    obs_path = _write_observables(tmp_path, observables)
+    model_path = write_model(json.dumps(model))
+    expected = _run_cli(
+        ["expectation", qasm_path, obs_path, "--noise-model", model_path], capsys
+    )
+    result = circuit.expectation(observables, noise_model=model)
+    assert result == expected
+    assert list(result["noise_model"]) == ["amplitude_damping", "depolarizing"]
+
+
+def test_expectation_known_values_and_range():
+    circuit = Circuit(1, 1).x(0)
+    result = circuit.expectation(
+        [
+            {"id": "z", "operators": [{"qubit": 0, "pauli": "Z"}]},
+            {"id": "x", "operators": [{"qubit": 0, "pauli": "X"}]},
+            {"id": "y", "operators": [{"qubit": 0, "pauli": "Y"}]},
+        ]
+    )
+    assert result["num_qubits"] == 1
+    values = {entry["id"]: entry["expectation"] for entry in result["results"]}
+    assert values == {"z": -1, "x": 0.0, "y": 0.0}
+    for value in values.values():
+        assert -1 <= value <= 1
+        assert math.isfinite(value)
+        assert not (value == 0 and math.copysign(1, value) < 0)
+
+
+def test_expectation_accepts_tuples_and_ignores_measurement_layout():
+    circuit = Circuit(2, 3).h(0).cx(0, 1).measure(0, 2).measure(1, 0)
+    result = circuit.expectation(
+        ({"id": "zz", "operators": ({"qubit": 0, "pauli": "Z"}, {"qubit": 1, "pauli": "Z"})},)
+    )
+    assert result["results"] == [{"id": "zz", "expectation": 1}]
+    assert "num_clbits" not in result
+
+
+def test_expectation_is_repeatable_and_modifies_nothing():
+    circuit = _bell()
+    observables = _observables()
+    snapshot = json.loads(json.dumps(observables))
+    before = circuit.operations
+    first = circuit.expectation(observables)
+    assert circuit.expectation(observables) == first
+    assert circuit.expectation(list(observables)) == first
+    assert observables == snapshot
+    assert circuit.operations == before
+
+
+def test_expectation_without_importing_cli():
+    code = (
+        "import sys\n"
+        "from quantum_circuit import Circuit\n"
+        'assert "quantum_circuit.cli" not in sys.modules\n'
+        "result = Circuit(1, 1).x(0).expectation("
+        '[{"id": "z", "operators": [{"qubit": 0, "pauli": "Z"}]}])\n'
+        'assert "quantum_circuit.cli" not in sys.modules\n'
+        'assert result["results"] == [{"id": "z", "expectation": -1}]\n'
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+@pytest.mark.parametrize("observables", [True, "observables", 42, None, {"id": "a"}])
+def test_expectation_observables_type_errors(observables):
+    with pytest.raises(TypeError):
+        _bell().expectation(observables)
+
+
+@pytest.mark.parametrize(
+    "observables",
+    [
+        [],
+        tuple(),
+        [{"id": str(i), "operators": []} for i in range(101)],
+    ],
+)
+def test_expectation_observables_count_errors(observables):
+    with pytest.raises(ValueError):
+        _bell().expectation(observables)
+
+
+@pytest.mark.parametrize("item", [True, 1, "x", [], None])
+def test_expectation_item_type_errors(item):
+    with pytest.raises(TypeError):
+        _bell().expectation([item])
+
+
+@pytest.mark.parametrize(
+    "observables",
+    [
+        [{"operators": []}],
+        [{"id": "a"}],
+        [{"id": "a", "operators": [], "extra": 1}],
+        [{"id": "", "operators": []}],
+        [{"id": "a", "operators": []}, {"id": "a", "operators": []}],
+    ],
+)
+def test_expectation_item_value_errors(observables):
+    with pytest.raises(ValueError):
+        _bell().expectation(observables)
+
+
+@pytest.mark.parametrize("observable_id", [True, 1, 1.5, None, ["a"]])
+def test_expectation_id_type_errors(observable_id):
+    with pytest.raises(TypeError):
+        _bell().expectation([{"id": observable_id, "operators": []}])
+
+
+@pytest.mark.parametrize("operators", [True, "ops", 1, None, {}])
+def test_expectation_operators_type_errors(operators):
+    with pytest.raises(TypeError):
+        _bell().expectation([{"id": "a", "operators": operators}])
+
+
+@pytest.mark.parametrize("operator", [True, 1, "x", [], None])
+def test_expectation_operator_type_errors(operator):
+    with pytest.raises(TypeError):
+        _bell().expectation([{"id": "a", "operators": [operator]}])
+
+
+@pytest.mark.parametrize("qubit", [True, 0.5, "0", None])
+def test_expectation_qubit_type_errors(qubit):
+    with pytest.raises(TypeError):
+        _bell().expectation([{"id": "a", "operators": [{"qubit": qubit, "pauli": "X"}]}])
+
+
+@pytest.mark.parametrize("qubit", [-1, 2, 5])
+def test_expectation_qubit_range_errors(qubit):
+    with pytest.raises(ValueError):
+        _bell().expectation([{"id": "a", "operators": [{"qubit": qubit, "pauli": "X"}]}])
+
+
+@pytest.mark.parametrize("pauli", [True, 1, 1.5, None, ["X"]])
+def test_expectation_pauli_type_errors(pauli):
+    with pytest.raises(TypeError):
+        _bell().expectation([{"id": "a", "operators": [{"qubit": 0, "pauli": pauli}]}])
+
+
+@pytest.mark.parametrize("pauli", ["x", "I", "XX", "", "z"])
+def test_expectation_pauli_value_errors(pauli):
+    with pytest.raises(ValueError):
+        _bell().expectation([{"id": "a", "operators": [{"qubit": 0, "pauli": pauli}]}])
+
+
+@pytest.mark.parametrize(
+    "operators",
+    [
+        [{"qubit": 0, "pauli": "X", "extra": 1}],
+        [{"pauli": "X"}],
+        [{"qubit": 0}],
+        [{"qubit": 0, "pauli": "X"}, {"qubit": 0, "pauli": "Z"}],
+    ],
+)
+def test_expectation_operator_value_errors(operators):
+    with pytest.raises(ValueError):
+        _bell().expectation([{"id": "a", "operators": operators}])
+
+
+def test_expectation_noise_model_errors():
+    circuit = _bell()
+    observables = _observables()
+    with pytest.raises(NoiseModelError):
+        circuit.expectation(observables, noise_model={})
+    with pytest.raises(NoiseModelError):
+        circuit.expectation(observables, noise_model={"unknown": 0.1})
+    with pytest.raises(NoiseModelError):
+        circuit.expectation(observables, noise_model="bit_flip")
+
+
+def test_expectation_noise_qubit_limit():
+    circuit = Circuit(11, 1).h(0).measure(0, 0)
+    observables = [{"id": "z", "operators": [{"qubit": 0, "pauli": "Z"}]}]
+    with pytest.raises(ValueError):
+        circuit.expectation(observables, noise_model={"bit_flip": 0.1})
+    # Without a noise model the state-vector path allows 20 qubits.
+    assert circuit.expectation(observables)["schema_version"] == 1

@@ -10,8 +10,9 @@ Operations keep their insertion order and every chaining method returns the
 same circuit object. The circuit renders to (:meth:`Circuit.to_qasm`) and
 parses from (:meth:`Circuit.from_qasm`) the OpenQASM 2.0 subset text the
 command line accepts, and simulates through the exact code paths of the
-``simulate`` and ``probabilities`` commands (:meth:`Circuit.sample`,
-:meth:`Circuit.probabilities`), so the returned dictionaries match the
+``simulate``, ``probabilities`` and ``expectation`` commands
+(:meth:`Circuit.sample`, :meth:`Circuit.probabilities`,
+:meth:`Circuit.expectation`), so the returned dictionaries match the
 commands' JSON objects field by field.
 
 Validation mirrors the parser's semantic rules: type mismatches raise
@@ -24,8 +25,9 @@ changes the circuit.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 
-from .core import SimulationError, run_probabilities, run_simulation
+from .core import SimulationError, run_expectation, run_probabilities, run_simulation
 from .gates import (
     Operation,
     gate_operation,
@@ -33,6 +35,7 @@ from .gates import (
     measurement_operation,
 )
 from .noise import validate_noise_model
+from .observables import MAX_OBSERVABLES
 from .openqasm import Program, parse
 
 # Register sizes accepted by the DSL match the parser's limit.
@@ -83,6 +86,117 @@ def _operation_line(op: Operation) -> str:
     if op.kind == "measure":
         return f"measure q[{op.targets[0]}] -> c[{op.targets[1]}];"
     return gate_qasm(op.kind, op.targets, op.params[0] if op.params else None)
+
+
+_OBSERVABLE_KEYS = ("id", "operators")
+_OPERATOR_KEYS = ("qubit", "pauli")
+_PAULIS = ("X", "Y", "Z")
+
+
+def _check_observable_operators(
+    operators: object, where: str, num_qubits: int
+) -> list[tuple[int, str]]:
+    if isinstance(operators, bool) or not isinstance(operators, (list, tuple)):
+        raise TypeError(
+            f"{where} 'operators' must be a list or tuple, "
+            f"got {type(operators).__name__}"
+        )
+    parsed: list[tuple[int, str]] = []
+    seen_qubits: set[int] = set()
+    for op_index, operator in enumerate(operators):
+        op_where = f"{where}.operators[{op_index}]"
+        if not isinstance(operator, Mapping):
+            raise TypeError(
+                f"{op_where} must be a mapping, got {type(operator).__name__}"
+            )
+        for key in operator:
+            if key not in _OPERATOR_KEYS:
+                raise ValueError(f"{op_where} has unknown field {key!r}")
+
+        if "qubit" not in operator:
+            raise ValueError(f"{op_where} is missing required field 'qubit'")
+        qubit = operator["qubit"]
+        if isinstance(qubit, bool) or not isinstance(qubit, int):
+            raise TypeError(
+                f"{op_where} 'qubit' must be an integer, "
+                f"got {type(qubit).__name__}"
+            )
+        if not 0 <= qubit < num_qubits:
+            raise ValueError(
+                f"{op_where} 'qubit' {qubit} out of range for register of "
+                f"size {num_qubits}"
+            )
+        if qubit in seen_qubits:
+            raise ValueError(f"{op_where} repeats qubit {qubit} within {where}")
+        seen_qubits.add(qubit)
+
+        if "pauli" not in operator:
+            raise ValueError(f"{op_where} is missing required field 'pauli'")
+        pauli = operator["pauli"]
+        if not isinstance(pauli, str):
+            raise TypeError(
+                f"{op_where} 'pauli' must be a string, got {type(pauli).__name__}"
+            )
+        if pauli not in _PAULIS:
+            raise ValueError(
+                f"{op_where} 'pauli' must be one of 'X', 'Y', 'Z', got {pauli!r}"
+            )
+
+        parsed.append((qubit, pauli))
+    return parsed
+
+
+def _check_observables(
+    observables: object, num_qubits: int
+) -> list[tuple[str, list[tuple[int, str]]]]:
+    """Validate one observables batch, returning ``(id, operators)`` pairs.
+
+    Type mismatches raise :class:`TypeError`; size, field, identifier,
+    qubit and Pauli violations raise :class:`ValueError`. The whole batch
+    is checked before any state evolution happens.
+    """
+    if isinstance(observables, bool) or not isinstance(observables, (list, tuple)):
+        raise TypeError(
+            f"observables must be a list or tuple, got {type(observables).__name__}"
+        )
+    if not 1 <= len(observables) <= MAX_OBSERVABLES:
+        raise ValueError(
+            f"observables must contain between 1 and {MAX_OBSERVABLES} entries, "
+            f"got {len(observables)}"
+        )
+
+    parsed: list[tuple[str, list[tuple[int, str]]]] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(observables):
+        where = f"observables[{index}]"
+        if not isinstance(item, Mapping):
+            raise TypeError(f"{where} must be a mapping, got {type(item).__name__}")
+        for key in item:
+            if key not in _OBSERVABLE_KEYS:
+                raise ValueError(f"{where} has unknown field {key!r}")
+
+        if "id" not in item:
+            raise ValueError(f"{where} is missing required field 'id'")
+        observable_id = item["id"]
+        if not isinstance(observable_id, str):
+            raise TypeError(
+                f"{where} 'id' must be a string, got {type(observable_id).__name__}"
+            )
+        if not observable_id:
+            raise ValueError(f"{where} 'id' must be a non-empty string")
+        if observable_id in seen_ids:
+            raise ValueError(f"duplicate observable id {observable_id!r}")
+        seen_ids.add(observable_id)
+
+        if "operators" not in item:
+            raise ValueError(f"{where} is missing required field 'operators'")
+        parsed.append(
+            (
+                observable_id,
+                _check_observable_operators(item["operators"], where, num_qubits),
+            )
+        )
+    return parsed
 
 
 class Circuit:
@@ -358,6 +472,40 @@ class Circuit:
         program = self._to_program()
         try:
             return run_probabilities(program, model)
+        except SimulationError as exc:
+            raise ValueError(str(exc)) from None
+
+    def expectation(self, observables, noise_model=None) -> dict:
+        """Pauli-product expectation values of the final pre-measurement state.
+
+        *observables* is a list or tuple of 1 to 100 mappings, each with an
+        ``id`` (a non-empty string, unique within the batch) and
+        ``operators`` (a list or tuple of mappings with a ``qubit`` — a
+        non-boolean integer inside the quantum register, not repeated
+        within one entry — and a ``pauli`` of ``"X"``, ``"Y"`` or
+        ``"Z"``). An empty ``operators`` sequence is the global identity.
+        Type mismatches raise :class:`TypeError`; size, field, identifier,
+        qubit and Pauli violations raise :class:`ValueError`, and the whole
+        batch is validated before any state evolution happens.
+
+        The result equals the JSON object the ``expectation`` command
+        produces for :meth:`to_qasm` with the equivalent observables
+        document and the same noise model, keeping the input order:
+        ``schema_version``, ``num_qubits``, ``noise_model`` (``None``
+        without a model) and ``results``, each result carrying the original
+        ``id`` and its ``expectation`` in ``[-1, 1]``. Measurement mappings
+        and the classical register width do not take part. Invalid noise
+        models raise :class:`~quantum_circuit.noise.NoiseModelError`; a
+        noisy circuit beyond the density-matrix qubit limit raises
+        :class:`ValueError`. Repeated calls with equal arguments return
+        equal results, and neither the circuit nor *observables* is
+        modified.
+        """
+        parsed = _check_observables(observables, self._num_qubits)
+        model = self._prepare_noise_model(noise_model)
+        program = self._to_program()
+        try:
+            return run_expectation(program, model, parsed)
         except SimulationError as exc:
             raise ValueError(str(exc)) from None
 

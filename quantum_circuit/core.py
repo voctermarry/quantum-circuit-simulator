@@ -1,7 +1,7 @@
 """CLI-independent simulation application core.
 
-Both the command line (``simulate``, ``probabilities`` and
-``verify-samples``) and the Python DSL (:class:`~quantum_circuit.circuit.Circuit`)
+Both the command line (``simulate``, ``probabilities``, ``expectation``
+and ``verify-samples``) and the Python DSL (:class:`~quantum_circuit.circuit.Circuit`)
 prepare and validate their own inputs, then delegate here for the actual
 work: state evolution, measurement probability aggregation, deterministic
 sampling and canonical success-payload assembly.
@@ -19,7 +19,13 @@ from __future__ import annotations
 
 import math
 
-from .noise import MAX_NOISE_QUBITS, simulate_density_matrix
+from .metrics import normalized_density_matrix
+from .noise import MAX_NOISE_QUBITS, evolve_density_matrix, simulate_density_matrix
+from .observables import (
+    density_matrix_expectation,
+    snap_expectation,
+    state_vector_expectation,
+)
 from .openqasm import Program
 from .simulator import (
     measurement_probabilities,
@@ -127,6 +133,57 @@ def run_probabilities(
     """Evolve *program* and assemble its ``probabilities`` payload."""
     basis_probabilities = evolve_basis_probabilities(program, noise_model)
     return probability_payload(program, basis_probabilities, noise_model)
+
+
+def run_expectation(
+    program: Program,
+    noise_model: dict[str, float] | None,
+    observables: list[tuple[str, list[tuple[int, str]]]],
+) -> dict[str, object]:
+    """Evaluate every observable against the final (pre-measurement) state.
+
+    *observables* is a validated batch of ``(id, operators)`` pairs in
+    input order, each operator a ``(qubit, pauli)`` tuple. Without a noise
+    model the state vector is evolved and ``<psi|P|psi>`` reported; with
+    one the normalized density matrix is evolved (at most
+    :data:`~quantum_circuit.noise.MAX_NOISE_QUBITS` qubits) and
+    ``Tr(rho P)`` reported. Raises :class:`SimulationError` when a noisy
+    circuit exceeds the density-matrix qubit limit.
+    """
+    if noise_model is None:
+        # The parser already caps the register at the 20-qubit
+        # state-vector limit.
+        state = simulate_state_vector(program)
+        results = [
+            {
+                "id": observable_id,
+                "expectation": snap_expectation(state_vector_expectation(state, operators)),
+            }
+            for observable_id, operators in observables
+        ]
+        return {
+            "schema_version": 1,
+            "num_qubits": program.num_qubits,
+            "noise_model": None,
+            "results": results,
+        }
+
+    if program.num_qubits > MAX_NOISE_QUBITS:
+        raise noisy_qubit_limit_error(program.num_qubits)
+    rho = normalized_density_matrix(evolve_density_matrix(program, noise_model))
+    results = [
+        {
+            "id": observable_id,
+            "expectation": snap_expectation(density_matrix_expectation(rho, operators)),
+        }
+        for observable_id, operators in observables
+    ]
+    return {
+        "schema_version": 1,
+        "num_qubits": program.num_qubits,
+        "noise_model": noise_model,
+        "results": results,
+    }
 
 
 def run_simulation(
