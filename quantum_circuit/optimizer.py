@@ -32,14 +32,29 @@ import heapq
 import math
 from dataclasses import dataclass
 
-from .openqasm import Operation, Program
+from .gates import (
+    CONTROLLED_ROTATION_GATES,
+    GATE_SPECS,
+    INVERSE_PAIRS as _REGISTRY_INVERSE_PAIRS,
+    ROTATION_GATES,
+    SELF_INVERSE_GATES,
+    Operation,
+    format_angle,
+    gate_qasm,
+)
+from .openqasm import Program
 
 # Rotations this small (after normalization to (-pi, pi]) act as the
 # identity within floating-point precision and are removed.
 _ANGLE_EPSILON = 1e-12
 
-_ROTATIONS = ("rx", "ry", "rz")
-_CONTROLLED_ROTATIONS = ("crx", "cry", "crz")
+_ROTATIONS = ROTATION_GATES
+_CONTROLLED_ROTATIONS = CONTROLLED_ROTATION_GATES
+
+# Backwards-compatible private alias: the DSL serializer used to take its
+# angle rendering from here; the single rendering rule now lives in the
+# gate-semantics registry.
+_format_angle = format_angle
 
 
 @dataclass(frozen=True)
@@ -85,35 +100,18 @@ def normalize_controlled_angle(angle: float) -> float:
     return reduced
 
 
-def _format_angle(angle: float) -> str:
-    """Render a normalized angle deterministically.
-
-    Uses the shortest decimal representation that round-trips to the same
-    float (at most 17 significant digits), which Python writes as plain
-    decimal or lowercase scientific notation. Negative zero is written as
-    ``0``.
-    """
-    if angle == 0.0:
-        return "0"
-    return repr(angle)
-
-
 def _gate_from_operation(op: Operation) -> Gate:
-    if op.kind in ("cx", "cz"):
-        return Gate(op.kind, (op.targets[0], op.targets[1]))
-    if op.kind == "swap":
+    spec = GATE_SPECS[op.kind]
+    if spec.symmetric:
         # swap is symmetric in its operands; canonicalize the operand order
         # so swap q[a],q[b] and swap q[b],q[a] share one canonical form.
         return Gate(op.kind, tuple(sorted(op.targets)))
-    if op.kind in _ROTATIONS:
-        return Gate(op.kind, (op.targets[0],), normalize_angle(op.params[0]))
-    if op.kind in _CONTROLLED_ROTATIONS:
-        return Gate(
-            op.kind,
-            (op.targets[0], op.targets[1]),
-            normalize_controlled_angle(op.params[0]),
-        )
-    return Gate(op.kind, (op.targets[0],))
+    if spec.axis is not None:
+        period = spec.rotation_period
+        assert period is not None
+        normalize = normalize_controlled_angle if period == 4.0 * math.pi else normalize_angle
+        return Gate(op.kind, tuple(op.targets), normalize(op.params[0]))
+    return Gate(op.kind, tuple(op.targets))
 
 
 def _sort_key(gate: Gate) -> tuple[int, int, str, str]:
@@ -123,18 +121,17 @@ def _sort_key(gate: Gate) -> tuple[int, int, str, str]:
     return (min(gate.qubits), max(gate.qubits), gate.kind, parameter)
 
 
-# Inverse pairs that cancel when adjacent on the same qubit.
-_INVERSE_PAIRS = (("s", "sdg"), ("sdg", "s"), ("t", "tdg"), ("tdg", "t"))
+# Inverse pairs that cancel when adjacent on the same qubit (both
+# directions), taken from the single gate registry.
+_INVERSE_PAIRS = _REGISTRY_INVERSE_PAIRS
 
 
 def _cancels(first: Gate, second: Gate) -> bool:
     """True when *second* immediately follows *first* and both vanish."""
     if first.qubits != second.qubits:
         return False
-    if first.kind in ("x", "h", "y", "z", "swap"):
+    if first.kind in SELF_INVERSE_GATES:
         return first.kind == second.kind
-    if first.kind in ("cx", "cz"):
-        return second.kind == first.kind
     return (first.kind, second.kind) in _INVERSE_PAIRS
 
 
@@ -266,18 +263,7 @@ def canonical_gates(operations: tuple[Operation, ...]) -> tuple[tuple[Gate, ...]
 
 
 def _gate_line(gate: Gate) -> str:
-    if gate.kind in ("cx", "cz", "swap"):
-        return f"{gate.kind} q[{gate.qubits[0]}],q[{gate.qubits[1]}];"
-    if gate.kind in _ROTATIONS:
-        assert gate.angle is not None
-        return f"{gate.kind}({_format_angle(gate.angle)}) q[{gate.qubits[0]}];"
-    if gate.kind in _CONTROLLED_ROTATIONS:
-        assert gate.angle is not None
-        return (
-            f"{gate.kind}({_format_angle(gate.angle)}) "
-            f"q[{gate.qubits[0]}],q[{gate.qubits[1]}];"
-        )
-    return f"{gate.kind} q[{gate.qubits[0]}];"
+    return gate_qasm(gate.kind, gate.qubits, gate.angle)
 
 
 def render(program: Program, gates: tuple[Gate, ...]) -> str:

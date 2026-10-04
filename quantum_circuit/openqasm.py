@@ -41,6 +41,20 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from .gates import (
+    CONTROLLED,
+    GATE_SPECS,
+    SWAP,
+    Operation,
+    gate_operation,
+    measurement_operation,
+)
+
+# Re-exported so modules that already import the validated operation type
+# from the parser module keep working; the definition itself lives with the
+# authoritative gate semantics in :mod:`quantum_circuit.gates`.
+__all__ = ["ParseError", "ValidationError", "Token", "Operation", "Program", "parse", "tokenize"]
+
 
 class ParseError(Exception):
     """A lexical or syntactic problem (reported as ``parse_error``)."""
@@ -71,15 +85,9 @@ class Token:
 
 
 _KEYWORDS = {"OPENQASM", "include", "qreg", "creg", "measure"}
-_BUILTIN_GATES = {
-    "x", "h", "y", "z", "s", "sdg", "t", "tdg",
-    "cx", "cz", "swap",
-    "rx", "ry", "rz", "crx", "cry", "crz",
-}
-_PARAMETERIZED_GATES = {"rx", "ry", "rz"}
-_CONTROLLED_GATES = {"cx", "cz"}
-_TWO_QUBIT_GATES = {"swap"}
-_CONTROLLED_PARAMETERIZED_GATES = {"crx", "cry", "crz"}
+# Gate names, operand shapes and parameter rules all come from the single
+# semantic registry in :mod:`quantum_circuit.gates`.
+_BUILTIN_GATES = frozenset(GATE_SPECS)
 
 # A state vector has 2**n amplitudes; larger registers cannot be simulated
 # and are rejected as illegal sizes rather than crashing.
@@ -186,16 +194,6 @@ def tokenize(source: str) -> list[Token]:
 
     tokens.append(Token("eof", "", line, col))
     return tokens
-
-
-@dataclass(frozen=True)
-class Operation:
-    """A validated gate application or measurement."""
-
-    kind: str  # 'x', 'h', 'y', 'z', 's', 'sdg', 't', 'tdg', 'cx', 'cz', 'swap',
-    # 'rx', 'ry', 'rz', 'crx', 'cry', 'crz' or 'measure'
-    targets: tuple[int, ...]  # qubit indices; measure appends the cbit index
-    params: tuple[float, ...] = ()  # gate angles in radians (rx/ry/rz/crx/cry/crz only)
 
 
 @dataclass(frozen=True)
@@ -473,7 +471,7 @@ def parse(source: str) -> Program:
             measured_qubits.add(q_idx)
             measured_clbits.add(c_idx)
             measurement_started = True
-            operations.append(Operation("measure", (q_idx, c_idx)))
+            operations.append(measurement_operation(q_idx, c_idx))
             continue
 
         if tok.kind == "ident":
@@ -491,7 +489,19 @@ def parse(source: str) -> Program:
                     tok.column,
                 )
             advance()
-            if gate_name in _CONTROLLED_GATES:
+            spec = GATE_SPECS[gate_name]
+            if spec.parameterized:
+                expect("(")
+                angle = parse_angle()
+                if peek().kind == ",":
+                    comma = peek()
+                    raise ParseError(
+                        f"gate {gate_name!r} takes exactly one angle parameter",
+                        comma.line,
+                        comma.column,
+                    )
+                expect(")")
+            if spec.style == CONTROLLED:
                 ctrl, _, _ = parse_index("q")
                 expect(",")
                 tgt, tgt_name_tok, _ = parse_index("q")
@@ -502,8 +512,8 @@ def parse(source: str) -> Program:
                         tgt_name_tok.line,
                         tgt_name_tok.column,
                     )
-                operations.append(Operation(gate_name, (ctrl, tgt)))
-            elif gate_name in _TWO_QUBIT_GATES:
+                targets = (ctrl, tgt)
+            elif spec.style == SWAP:
                 first, _, _ = parse_index("q")
                 expect(",")
                 second, second_name_tok, _ = parse_index("q")
@@ -514,47 +524,13 @@ def parse(source: str) -> Program:
                         second_name_tok.line,
                         second_name_tok.column,
                     )
-                operations.append(Operation(gate_name, (first, second)))
-            elif gate_name in _CONTROLLED_PARAMETERIZED_GATES:
-                expect("(")
-                angle = parse_angle()
-                if peek().kind == ",":
-                    comma = peek()
-                    raise ParseError(
-                        f"gate {gate_name!r} takes exactly one angle parameter",
-                        comma.line,
-                        comma.column,
-                    )
-                expect(")")
-                ctrl, _, _ = parse_index("q")
-                expect(",")
-                tgt, tgt_name_tok, _ = parse_index("q")
-                expect(";")
-                if ctrl == tgt:
-                    raise ValidationError(
-                        f"{gate_name} control and target must be different qubits",
-                        tgt_name_tok.line,
-                        tgt_name_tok.column,
-                    )
-                operations.append(Operation(gate_name, (ctrl, tgt), (angle,)))
-            elif gate_name in _PARAMETERIZED_GATES:
-                expect("(")
-                angle = parse_angle()
-                if peek().kind == ",":
-                    comma = peek()
-                    raise ParseError(
-                        f"gate {gate_name!r} takes exactly one angle parameter",
-                        comma.line,
-                        comma.column,
-                    )
-                expect(")")
-                target, _, _ = parse_index("q")
-                expect(";")
-                operations.append(Operation(gate_name, (target,), (angle,)))
+                targets = (first, second)
             else:
                 target, _, _ = parse_index("q")
                 expect(";")
-                operations.append(Operation(gate_name, (target,)))
+                targets = (target,)
+            params = (angle,) if spec.parameterized else ()
+            operations.append(gate_operation(gate_name, targets, params))
             continue
 
         raise ParseError(

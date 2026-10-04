@@ -18,11 +18,14 @@ on one qubit are applied in :data:`CHANNEL_ORDER` order.
 
 from __future__ import annotations
 
-import cmath
 import json
 import math
 from collections.abc import Mapping
 
+from .gates import (
+    controlled_target_unitary,
+    single_qubit_unitary,
+)
 from .openqasm import Program
 
 # Fixed order in which channels are applied per qubit and echoed back.
@@ -31,8 +34,6 @@ CHANNEL_ORDER = ("amplitude_damping", "phase_damping", "bit_flip", "depolarizing
 # A density matrix holds 4**n entries, so noisy simulation is capped well
 # below the state-vector register limit.
 MAX_NOISE_QUBITS = 10
-
-_SQRT1_2 = 2.0**-0.5
 
 
 class NoiseModelError(Exception):
@@ -113,35 +114,6 @@ def _basis_offsets(size: int, bit: int):
     step = bit << 1
     for base in range(0, size, step):
         yield from range(base, base + bit)
-
-
-def _gate_matrix(kind: str, params: tuple[float, ...]) -> tuple[complex, complex, complex, complex]:
-    if kind == "x":
-        return (0j, 1 + 0j, 1 + 0j, 0j)
-    if kind == "h":
-        return (_SQRT1_2, _SQRT1_2, _SQRT1_2, -_SQRT1_2)
-    if kind == "y":
-        return (0j, -1j, 1j, 0j)
-    if kind == "z":
-        return (1 + 0j, 0j, 0j, -1 + 0j)
-    if kind == "s":
-        return (1 + 0j, 0j, 0j, 1j)
-    if kind == "sdg":
-        return (1 + 0j, 0j, 0j, -1j)
-    if kind == "t":
-        return (1 + 0j, 0j, 0j, cmath.exp(0.25j * math.pi))
-    if kind == "tdg":
-        return (1 + 0j, 0j, 0j, cmath.exp(-0.25j * math.pi))
-    theta = params[0]
-    c = math.cos(theta / 2)
-    s = math.sin(theta / 2)
-    if kind == "rx":
-        return (c, -1j * s, -1j * s, c)
-    if kind == "ry":
-        return (c, -s, s, c)
-    if kind == "rz":
-        return (cmath.exp(-0.5j * theta), 0j, 0j, cmath.exp(0.5j * theta))
-    raise AssertionError(f"no single-qubit matrix for gate {kind!r}")
 
 
 def _apply_single_qubit(rho: list[list[complex]], qubit: int, size: int, matrix) -> None:
@@ -328,19 +300,20 @@ def evolve_density_matrix(program: Program, noise: dict[str, float]) -> list[lis
     for op in program.operations:
         if op.kind == "measure":
             continue
+        spec = op.spec
         if op.kind == "cx":
             _apply_cx(rho, op.targets[0], op.targets[1], size)
         elif op.kind == "swap":
             _apply_swap(rho, op.targets[0], op.targets[1], size)
-        elif op.kind == "cz":
-            _apply_controlled(
-                rho, op.targets[0], op.targets[1], size, (1 + 0j, 0j, 0j, -1 + 0j)
-            )
-        elif op.kind in ("crx", "cry", "crz"):
-            matrix = _gate_matrix(op.kind[1:], op.params)
+        elif spec.is_controlled:
+            # cz and the controlled angle rotations embed the gate's one
+            # registered target unitary on the target when control is 1.
+            matrix = controlled_target_unitary(op.kind, op.params)
             _apply_controlled(rho, op.targets[0], op.targets[1], size, matrix)
         else:
-            _apply_single_qubit(rho, op.targets[0], size, _gate_matrix(op.kind, op.params))
+            _apply_single_qubit(
+                rho, op.targets[0], size, single_qubit_unitary(op.kind, op.params)
+            )
         for qubit in sorted(set(op.targets)):
             for channel in CHANNEL_ORDER:
                 probability = noise.get(channel)

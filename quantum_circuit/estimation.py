@@ -8,20 +8,22 @@ validated :class:`~quantum_circuit.openqasm.Program`.
 
 from __future__ import annotations
 
+from .gates import (
+    GATE_ORDER_V1 as _GATE_ORDER_V1,
+    GATE_ORDER_V2 as _GATE_ORDER_V2,
+    GATE_ORDER_V3 as _GATE_ORDER_V3,
+    SCHEMA_V2_GATES as _V2_GATES,
+    SCHEMA_V3_GATES as _V3_GATES,
+)
 from .openqasm import Program
 
-# Gates reported in ``gate_counts``, in the fixed output order. The
-# schema_version 1 payload (circuits using only the original gate set) keeps
-# the historical six-entry mapping byte-identical; as soon as any of the
-# controlled gates ``cz``/``crx``/``cry``/``crz`` appears the payload becomes
-# schema_version 2 with all ten entries in this fixed order; any of the
-# gates ``y``/``z``/``s``/``sdg``/``t``/``tdg``/``swap`` makes it
-# schema_version 3 with seventeen entries.
-_GATE_ORDER_V1 = ("x", "h", "cx", "rx", "ry", "rz")
-_GATE_ORDER_V2 = ("x", "h", "cx", "cz", "rx", "ry", "rz", "crx", "cry", "crz")
-_GATE_ORDER_V3 = _GATE_ORDER_V2 + ("y", "z", "s", "sdg", "t", "tdg", "swap")
-_V2_GATES = frozenset(_GATE_ORDER_V2) - frozenset(_GATE_ORDER_V1)
-_V3_GATES = frozenset(_GATE_ORDER_V3) - frozenset(_GATE_ORDER_V2)
+# Gate-count orders for the three schema versions, fixed in the single gate
+# registry. The schema_version 1 payload keeps the historical six-entry
+# mapping byte-identical; as soon as any of the controlled gates
+# ``cz``/``crx``/``cry``/``crz`` appears the payload becomes schema_version 2
+# with all ten entries; any of the gates
+# ``y``/``z``/``s``/``sdg``/``t``/``tdg``/``swap`` makes it schema_version 3
+# with seventeen entries.
 
 # One complex amplitude/matrix element payload: two doubles (real, imag).
 _COMPLEX_BYTES = 16

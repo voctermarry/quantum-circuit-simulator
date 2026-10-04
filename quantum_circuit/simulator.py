@@ -6,7 +6,12 @@ import cmath
 import math
 import random
 
-from .openqasm import Operation, Program
+from .gates import (
+    PHASE_FACTORS,
+    Operation,
+    rotation_matrix,
+)
+from .openqasm import Program
 
 _SQRT1_2 = 2.0**-0.5
 
@@ -45,14 +50,9 @@ def _pauli_y(state: list[complex], qubit: int, num_qubits: int) -> None:
 
 
 # Phase gates diag(1, phase): z, s/sdg (diag(1, +-i)) and t/tdg
-# (phase exp(+-i*pi/4)).
-_PHASE_GATES = {
-    "z": -1 + 0j,
-    "s": 1j,
-    "sdg": -1j,
-    "t": cmath.exp(0.25j * math.pi),
-    "tdg": cmath.exp(-0.25j * math.pi),
-}
+# (phase exp(+-i*pi/4)). The factors come from the single gate registry so
+# the state-vector path cannot diverge from the density/unitary matrices.
+_PHASE_GATES = PHASE_FACTORS
 
 
 def _phase(state: list[complex], qubit: int, num_qubits: int, factor: complex) -> None:
@@ -104,18 +104,6 @@ def _controlled_single(
             state[high] = g10 * a + g11 * b
 
 
-def _rotation_matrix(kind: str, theta: float) -> tuple[complex, complex, complex, complex]:
-    """The single-qubit matrix of an rx/ry/rz rotation by *theta* radians."""
-    c = math.cos(theta / 2)
-    s = math.sin(theta / 2)
-    if kind == "rx":
-        return (c, -1j * s, -1j * s, c)
-    if kind == "ry":
-        return (c, -s, s, c)
-    # rz
-    return (cmath.exp(-0.5j * theta), 0j, 0j, cmath.exp(0.5j * theta))
-
-
 def _rx(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None:
     c = math.cos(theta / 2)
     s = math.sin(theta / 2)
@@ -156,31 +144,41 @@ def _rz(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None
 
 
 def _apply_gate(state: list[complex], op: Operation, num_qubits: int) -> None:
-    """Apply one (non-measurement) *op* to *state* in place."""
-    if op.kind == "x":
+    """Apply one (non-measurement) *op* to *state* in place.
+
+    The dispatch uses the gate's registered style and the single shared
+    matrix expression in :mod:`quantum_circuit.gates`; only the numeric
+    state-vector kernels below are local to this module.
+    """
+    kind = op.kind
+    if kind == "x":
         _pauli_x(state, op.targets[0], num_qubits)
-    elif op.kind == "h":
+    elif kind == "h":
         _hadamard(state, op.targets[0], num_qubits)
-    elif op.kind == "y":
+    elif kind == "y":
         _pauli_y(state, op.targets[0], num_qubits)
-    elif op.kind in _PHASE_GATES:
-        _phase(state, op.targets[0], num_qubits, _PHASE_GATES[op.kind])
-    elif op.kind == "swap":
+    elif kind in _PHASE_GATES:
+        _phase(state, op.targets[0], num_qubits, _PHASE_GATES[kind])
+    elif kind == "swap":
         _swap(state, op.targets[0], op.targets[1], num_qubits)
-    elif op.kind == "cx":
+    elif kind == "cx":
         _controlled_x(state, op.targets[0], op.targets[1], num_qubits)
-    elif op.kind == "cz":
+    elif kind == "cz":
         _controlled_single(
-            state, op.targets[0], op.targets[1], num_qubits, (1 + 0j, 0j, 0j, -1 + 0j)
+            state, op.targets[0], op.targets[1], num_qubits, op.spec.target_unitary()
         )
-    elif op.kind == "rx":
-        _rx(state, op.targets[0], num_qubits, op.params[0])
-    elif op.kind == "ry":
-        _ry(state, op.targets[0], num_qubits, op.params[0])
-    elif op.kind == "rz":
-        _rz(state, op.targets[0], num_qubits, op.params[0])
-    elif op.kind in ("crx", "cry", "crz"):
-        matrix = _rotation_matrix(op.kind[1:], op.params[0])
+    elif kind in ("rx", "ry", "rz"):
+        axis = op.spec.axis
+        if axis == "x":
+            _rx(state, op.targets[0], num_qubits, op.params[0])
+        elif axis == "y":
+            _ry(state, op.targets[0], num_qubits, op.params[0])
+        else:
+            _rz(state, op.targets[0], num_qubits, op.params[0])
+    else:
+        # Controlled angle rotations crx/cry/crz: the target embedding is
+        # the one matrix definition shared with the density path.
+        matrix = rotation_matrix(op.spec.axis, op.params[0])
         _controlled_single(state, op.targets[0], op.targets[1], num_qubits, matrix)
 
 
