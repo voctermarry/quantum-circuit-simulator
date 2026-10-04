@@ -435,3 +435,233 @@ def test_noise_model_accepts_int_probabilities_and_canonical_order():
     result = circuit.sample(noise_model={"depolarizing": 0, "amplitude_damping": 1})
     assert list(result["noise_model"]) == ["amplitude_damping", "depolarizing"]
     assert result["noise_model"] == {"amplitude_damping": 1.0, "depolarizing": 0.0}
+
+
+# --------------------------------------------- expectation vs expectation
+
+
+@pytest.fixture
+def write_observables(tmp_path):
+    def _write(observables, name: str = "observables.json"):
+        path = tmp_path / name
+        path.write_text(
+            json.dumps({"schema_version": 1, "observables": observables}),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    return _write
+
+
+_OBSERVABLES = [
+    {"id": "zz", "operators": [{"qubit": 0, "pauli": "Z"}, {"qubit": 1, "pauli": "Z"}]},
+    {"id": "xx", "operators": [{"qubit": 0, "pauli": "X"}, {"qubit": 1, "pauli": "X"}]},
+    {"id": "yi", "operators": [{"qubit": 0, "pauli": "Y"}]},
+    {"id": "identity", "operators": []},
+]
+
+
+def test_expectation_matches_command(write_qasm, write_observables, capsys):
+    circuit = _bell()
+    path = write_qasm(circuit.to_qasm().split(HEADER, 1)[1])
+    obs_path = write_observables(_OBSERVABLES)
+    expected = _run_cli(["expectation", path, obs_path], capsys)
+    assert circuit.expectation(_OBSERVABLES) == expected
+
+
+def test_expectation_with_noise_matches_command(
+    write_qasm, write_observables, write_model, capsys
+):
+    circuit = Circuit(2, 2).h(0).cx(0, 1).ry(0.7, 1).measure(0, 0).measure(1, 1)
+    model = {"amplitude_damping": 0.1, "depolarizing": 0.05}
+    path = write_qasm(circuit.to_qasm().split(HEADER, 1)[1])
+    obs_path = write_observables(_OBSERVABLES)
+    model_path = write_model(json.dumps(model))
+    expected = _run_cli(
+        ["expectation", path, obs_path, "--noise-model", model_path], capsys
+    )
+    assert circuit.expectation(_OBSERVABLES, noise_model=model) == expected
+
+
+def test_expectation_payload_shape_and_values():
+    circuit = Circuit(1, 1)
+    result = circuit.expectation(
+        [
+            {"id": "z", "operators": [{"qubit": 0, "pauli": "Z"}]},
+            {"id": "x", "operators": [{"qubit": 0, "pauli": "X"}]},
+            {"id": "i", "operators": []},
+        ]
+    )
+    assert list(result) == ["schema_version", "num_qubits", "noise_model", "results"]
+    assert result["schema_version"] == 1
+    assert result["num_qubits"] == 1
+    assert result["noise_model"] is None
+    assert [entry["id"] for entry in result["results"]] == ["z", "x", "i"]
+    assert result["results"][0]["expectation"] == 1
+    assert result["results"][1]["expectation"] == 0.0
+    assert result["results"][2]["expectation"] == 1
+    for entry in result["results"]:
+        value = entry["expectation"]
+        assert -1 <= value <= 1
+        assert not (value == 0 and math.copysign(1, value) < 0)
+
+
+def test_expectation_accepts_tuples_and_ignores_measurement_layout():
+    observables = (
+        {"id": "z0", "operators": ({"qubit": 0, "pauli": "Z"},)},
+        {"id": "z1", "operators": ({"qubit": 1, "pauli": "Z"},)},
+    )
+    plain = Circuit(2, 2).h(0).cx(0, 1)
+    measured = Circuit(2, 2).h(0).cx(0, 1).measure(0, 1).measure(1, 0)
+    assert plain.expectation(observables) == measured.expectation(observables)
+    wider = Circuit(2, 5).h(0).cx(0, 1).measure(0, 3)
+    assert plain.expectation(observables)["results"] == wider.expectation(observables)["results"]
+
+
+def test_expectation_is_repeatable_and_modifies_nothing():
+    circuit = _bell()
+    observables = [
+        {"id": "zz", "operators": [{"qubit": 0, "pauli": "Z"}, {"qubit": 1, "pauli": "Z"}]}
+    ]
+    snapshot = json.loads(json.dumps(observables))
+    before = circuit.operations
+    first = circuit.expectation(observables, noise_model={"bit_flip": 0.2})
+    assert circuit.expectation(observables, noise_model={"bit_flip": 0.2}) == first
+    assert circuit.operations == before
+    assert observables == snapshot
+
+
+@pytest.mark.parametrize("observables", [None, "zz", 42, {"id": "z"}, 1.5])
+def test_expectation_observables_type_errors(observables):
+    with pytest.raises(TypeError):
+        _bell().expectation(observables)
+
+
+@pytest.mark.parametrize("observables", [[], ()])
+def test_expectation_count_errors(observables):
+    with pytest.raises(ValueError):
+        _bell().expectation(observables)
+
+
+def test_expectation_too_many_observables():
+    observables = [{"id": f"o{i}", "operators": []} for i in range(101)]
+    with pytest.raises(ValueError):
+        _bell().expectation(observables)
+    assert len(_bell().expectation(observables[:100])["results"]) == 100
+
+
+@pytest.mark.parametrize("item", [None, "z", 1, ["id", "operators"], ({"id": "z"},)])
+def test_expectation_item_type_errors(item):
+    with pytest.raises(TypeError):
+        _bell().expectation([item])
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"operators": []},
+        {"id": "z"},
+        {"id": "z", "operators": [], "pauli": "X"},
+        {"id": "", "operators": []},
+        {"id": "z", "operators": [], "extra": 1},
+    ],
+)
+def test_expectation_item_value_errors(item):
+    with pytest.raises(ValueError):
+        _bell().expectation([item])
+
+
+def test_expectation_duplicate_id():
+    with pytest.raises(ValueError):
+        _bell().expectation(
+            [{"id": "z", "operators": []}, {"id": "z", "operators": []}]
+        )
+
+
+@pytest.mark.parametrize("observable_id", [None, 1, 1.5, b"z", ["z"]])
+def test_expectation_id_type_errors(observable_id):
+    with pytest.raises(TypeError):
+        _bell().expectation([{"id": observable_id, "operators": []}])
+
+
+@pytest.mark.parametrize("operators", [None, "X", 1, {"qubit": 0, "pauli": "X"}])
+def test_expectation_operators_type_errors(operators):
+    with pytest.raises(TypeError):
+        _bell().expectation([{"id": "z", "operators": operators}])
+
+
+@pytest.mark.parametrize("operator", [None, "X", 1, [0, "X"]])
+def test_expectation_operator_type_errors(operator):
+    with pytest.raises(TypeError):
+        _bell().expectation([{"id": "z", "operators": [operator]}])
+
+
+@pytest.mark.parametrize(
+    "operator",
+    [
+        {"pauli": "X"},
+        {"qubit": 0},
+        {"qubit": 0, "pauli": "X", "extra": 1},
+        {"qubit": -1, "pauli": "X"},
+        {"qubit": 2, "pauli": "X"},
+        {"qubit": 0, "pauli": "x"},
+        {"qubit": 0, "pauli": "I"},
+        {"qubit": 0, "pauli": ""},
+    ],
+)
+def test_expectation_operator_value_errors(operator):
+    with pytest.raises(ValueError):
+        _bell().expectation([{"id": "z", "operators": [operator]}])
+
+
+@pytest.mark.parametrize("qubit", [True, False, 0.0, "0", None])
+def test_expectation_qubit_type_errors(qubit):
+    with pytest.raises(TypeError):
+        _bell().expectation([{"id": "z", "operators": [{"qubit": qubit, "pauli": "X"}]}])
+
+
+@pytest.mark.parametrize("pauli", [None, 1, 1.5, ["X"], b"X"])
+def test_expectation_pauli_type_errors(pauli):
+    with pytest.raises(TypeError):
+        _bell().expectation([{"id": "z", "operators": [{"qubit": 0, "pauli": pauli}]}])
+
+
+def test_expectation_repeated_qubit_within_one_observable():
+    with pytest.raises(ValueError):
+        _bell().expectation(
+            [
+                {
+                    "id": "bad",
+                    "operators": [{"qubit": 0, "pauli": "X"}, {"qubit": 0, "pauli": "Z"}],
+                }
+            ]
+        )
+    # The same qubit in different observables of the batch is fine.
+    result = _bell().expectation(
+        [
+            {"id": "x0", "operators": [{"qubit": 0, "pauli": "X"}]},
+            {"id": "z0", "operators": [{"qubit": 0, "pauli": "Z"}]},
+        ]
+    )
+    assert [entry["id"] for entry in result["results"]] == ["x0", "z0"]
+
+
+def test_expectation_noise_model_errors():
+    circuit = _bell()
+    observables = [{"id": "zz", "operators": []}]
+    with pytest.raises(NoiseModelError):
+        circuit.expectation(observables, noise_model={})
+    with pytest.raises(NoiseModelError):
+        circuit.expectation(observables, noise_model={"unknown": 0.1})
+    with pytest.raises(NoiseModelError):
+        circuit.expectation(observables, noise_model={"bit_flip": math.nan})
+
+
+def test_expectation_noise_qubit_limit():
+    circuit = Circuit(11, 11)
+    with pytest.raises(ValueError):
+        circuit.expectation([{"id": "i", "operators": []}], noise_model={"bit_flip": 0.1})
+    # Without a noise model the state-vector path handles 11 qubits fine.
+    assert circuit.expectation([{"id": "i", "operators": []}])["results"] == [
+        {"id": "i", "expectation": 1}
+    ]

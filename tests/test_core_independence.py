@@ -40,6 +40,14 @@ noisy_sample = circuit.sample(
 noisy_probabilities = circuit.probabilities(
     noise_model={"phase_damping": 0.2, "bit_flip": 0.1}
 )
+observables = [
+    {"id": "zz", "operators": [{"qubit": 0, "pauli": "Z"}, {"qubit": 1, "pauli": "Z"}]},
+    {"id": "identity", "operators": []},
+]
+expectation = circuit.expectation(observables)
+noisy_expectation = circuit.expectation(
+    observables, noise_model={"depolarizing": 0.1, "amplitude_damping": 0.05}
+)
 
 # No import of the command line may have happened at any point.
 assert "quantum_circuit.cli" not in sys.modules
@@ -56,6 +64,13 @@ assert (
     == noisy_sample
 )
 assert circuit.probabilities({"phase_damping": 0.2, "bit_flip": 0.1}) == noisy_probabilities
+assert circuit.expectation(observables) == expectation
+assert (
+    circuit.expectation(
+        observables, noise_model={"amplitude_damping": 0.05, "depolarizing": 0.1}
+    )
+    == noisy_expectation
+)
 
 # The canonical payload field order matches the documented commands.
 assert list(sample) == [
@@ -66,6 +81,10 @@ assert list(noisy_sample) == [
     "noise_model", "counts",
 ]
 assert list(noisy_sample["noise_model"]) == ["amplitude_damping", "depolarizing"]
+assert list(expectation) == ["schema_version", "num_qubits", "noise_model", "results"]
+assert expectation["noise_model"] is None
+assert [entry["id"] for entry in expectation["results"]] == ["zz", "identity"]
+assert list(noisy_expectation["noise_model"]) == ["amplitude_damping", "depolarizing"]
 
 print("ok")
 """

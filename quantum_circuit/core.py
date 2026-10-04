@@ -1,10 +1,11 @@
 """CLI-independent simulation application core.
 
-Both the command line (``simulate``, ``probabilities`` and
-``verify-samples``) and the Python DSL (:class:`~quantum_circuit.circuit.Circuit`)
+Both the command line (``simulate``, ``probabilities``, ``expectation``
+and ``verify-samples``) and the Python DSL (:class:`~quantum_circuit.circuit.Circuit`)
 prepare and validate their own inputs, then delegate here for the actual
 work: state evolution, measurement probability aggregation, deterministic
-sampling and canonical success-payload assembly.
+sampling, observable expectation evaluation and canonical success-payload
+assembly.
 
 This module never imports :mod:`quantum_circuit.cli` and performs no file,
 standard input, environment or standard stream access. It receives only a
@@ -19,7 +20,13 @@ from __future__ import annotations
 
 import math
 
-from .noise import MAX_NOISE_QUBITS, simulate_density_matrix
+from .metrics import normalized_density_matrix
+from .noise import MAX_NOISE_QUBITS, evolve_density_matrix, simulate_density_matrix
+from .observables import (
+    density_matrix_expectation,
+    snap_expectation,
+    state_vector_expectation,
+)
 from .openqasm import Program
 from .simulator import (
     measurement_probabilities,
@@ -127,6 +134,53 @@ def run_probabilities(
     """Evolve *program* and assemble its ``probabilities`` payload."""
     basis_probabilities = evolve_basis_probabilities(program, noise_model)
     return probability_payload(program, basis_probabilities, noise_model)
+
+
+def run_expectation(
+    program: Program,
+    observables: list[tuple[str, list[tuple[int, str]]]],
+    noise_model: dict[str, float] | None = None,
+) -> dict[str, object]:
+    """Evolve *program* and evaluate Pauli-product observables against it.
+
+    Each observable is a ``(id, operators)`` pair in input order, where
+    every operator is a validated ``(qubit, pauli)`` tuple; expectations
+    are taken against the final pre-measurement state (the state vector
+    without a noise model, the normalized density matrix with one) and
+    snapped by :func:`~quantum_circuit.observables.snap_expectation`.
+    Raises :class:`SimulationError` when a noisy circuit exceeds the
+    density-matrix qubit limit.
+    """
+    if noise_model is None:
+        # The parser already caps the register at the 20-qubit
+        # state-vector limit.
+        state = simulate_state_vector(program)
+        results = [
+            {
+                "id": observable_id,
+                "expectation": snap_expectation(state_vector_expectation(state, operators)),
+            }
+            for observable_id, operators in observables
+        ]
+        model = None
+    else:
+        if program.num_qubits > MAX_NOISE_QUBITS:
+            raise noisy_qubit_limit_error(program.num_qubits)
+        rho = normalized_density_matrix(evolve_density_matrix(program, noise_model))
+        results = [
+            {
+                "id": observable_id,
+                "expectation": snap_expectation(density_matrix_expectation(rho, operators)),
+            }
+            for observable_id, operators in observables
+        ]
+        model = noise_model
+    return {
+        "schema_version": 1,
+        "num_qubits": program.num_qubits,
+        "noise_model": model,
+        "results": results,
+    }
 
 
 def run_simulation(

@@ -10,8 +10,9 @@ Operations keep their insertion order and every chaining method returns the
 same circuit object. The circuit renders to (:meth:`Circuit.to_qasm`) and
 parses from (:meth:`Circuit.from_qasm`) the OpenQASM 2.0 subset text the
 command line accepts, and simulates through the exact code paths of the
-``simulate`` and ``probabilities`` commands (:meth:`Circuit.sample`,
-:meth:`Circuit.probabilities`), so the returned dictionaries match the
+``simulate``, ``probabilities`` and ``expectation`` commands
+(:meth:`Circuit.sample`, :meth:`Circuit.probabilities`,
+:meth:`Circuit.expectation`), so the returned dictionaries match the
 commands' JSON objects field by field.
 
 Validation mirrors the parser's semantic rules: type mismatches raise
@@ -24,8 +25,9 @@ changes the circuit.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 
-from .core import SimulationError, run_probabilities, run_simulation
+from .core import SimulationError, run_expectation, run_probabilities, run_simulation
 from .gates import (
     Operation,
     gate_operation,
@@ -33,6 +35,7 @@ from .gates import (
     measurement_operation,
 )
 from .noise import validate_noise_model
+from .observables import MAX_OBSERVABLES
 from .openqasm import Program, parse
 
 # Register sizes accepted by the DSL match the parser's limit.
@@ -76,6 +79,110 @@ def _check_angle(value: object) -> float:
     if not math.isfinite(angle):
         raise ValueError("angle must be a finite number")
     return angle
+
+
+_PAULIS = ("X", "Y", "Z")
+
+
+def _check_observables(
+    observables: object, num_qubits: int
+) -> list[tuple[str, list[tuple[int, str]]]]:
+    """Validate a batch of Pauli-product observables for the DSL.
+
+    Mirrors the structural rules of the ``expectation`` command's
+    observables document, with the DSL's error split: type mismatches
+    raise :class:`TypeError`, value problems :class:`ValueError`. The
+    whole batch is checked before any state is evolved, and the input
+    objects are never modified.
+    """
+    if not isinstance(observables, (list, tuple)):
+        raise TypeError(
+            f"observables must be a list or tuple, got {type(observables).__name__}"
+        )
+    if not 1 <= len(observables) <= MAX_OBSERVABLES:
+        raise ValueError(
+            f"observables must contain between 1 and {MAX_OBSERVABLES} entries, "
+            f"got {len(observables)}"
+        )
+
+    parsed: list[tuple[str, list[tuple[int, str]]]] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(observables):
+        where = f"observables[{index}]"
+        if not isinstance(item, Mapping):
+            raise TypeError(
+                f"{where} must be a mapping, got {type(item).__name__}"
+            )
+        for key in item:
+            if key not in ("id", "operators"):
+                raise ValueError(f"{where} has unknown key {key!r}")
+
+        if "id" not in item:
+            raise ValueError(f"{where} is missing required key 'id'")
+        observable_id = item["id"]
+        if not isinstance(observable_id, str):
+            raise TypeError(
+                f"{where} 'id' must be a string, got {type(observable_id).__name__}"
+            )
+        if not observable_id:
+            raise ValueError(f"{where} 'id' must be a non-empty string")
+        if observable_id in seen_ids:
+            raise ValueError(f"duplicate observable id {observable_id!r}")
+        seen_ids.add(observable_id)
+
+        if "operators" not in item:
+            raise ValueError(f"{where} is missing required key 'operators'")
+        operators = item["operators"]
+        if not isinstance(operators, (list, tuple)):
+            raise TypeError(
+                f"{where} 'operators' must be a list or tuple, "
+                f"got {type(operators).__name__}"
+            )
+
+        parsed_operators: list[tuple[int, str]] = []
+        seen_qubits: set[int] = set()
+        for op_index, operator in enumerate(operators):
+            op_where = f"{where}.operators[{op_index}]"
+            if not isinstance(operator, Mapping):
+                raise TypeError(
+                    f"{op_where} must be a mapping, got {type(operator).__name__}"
+                )
+            for key in operator:
+                if key not in ("qubit", "pauli"):
+                    raise ValueError(f"{op_where} has unknown key {key!r}")
+
+            if "qubit" not in operator:
+                raise ValueError(f"{op_where} is missing required key 'qubit'")
+            qubit = operator["qubit"]
+            if isinstance(qubit, bool) or not isinstance(qubit, int):
+                raise TypeError(
+                    f"{op_where} 'qubit' must be an integer, got {type(qubit).__name__}"
+                )
+            if not 0 <= qubit < num_qubits:
+                raise ValueError(
+                    f"{op_where} 'qubit' must be between 0 and {num_qubits - 1}, "
+                    f"got {qubit}"
+                )
+            if qubit in seen_qubits:
+                raise ValueError(f"{op_where} repeats qubit {qubit} within {where}")
+            seen_qubits.add(qubit)
+
+            if "pauli" not in operator:
+                raise ValueError(f"{op_where} is missing required key 'pauli'")
+            pauli = operator["pauli"]
+            if not isinstance(pauli, str):
+                raise TypeError(
+                    f"{op_where} 'pauli' must be a string, got {type(pauli).__name__}"
+                )
+            if pauli not in _PAULIS:
+                raise ValueError(
+                    f"{op_where} 'pauli' must be one of 'X', 'Y', 'Z', got {pauli!r}"
+                )
+
+            parsed_operators.append((qubit, pauli))
+        parsed.append((observable_id, parsed_operators))
+
+    return parsed
 
 
 def _operation_line(op: Operation) -> str:
@@ -358,6 +465,43 @@ class Circuit:
         program = self._to_program()
         try:
             return run_probabilities(program, model)
+        except SimulationError as exc:
+            raise ValueError(str(exc)) from None
+
+    def expectation(self, observables, noise_model=None) -> dict:
+        """Pauli-product expectations of the pre-measurement state, as a dict.
+
+        The result equals the JSON object the ``expectation`` command
+        produces for :meth:`to_qasm` with an equivalent observables
+        document and the same noise model: ``schema_version``,
+        ``num_qubits``, ``noise_model`` (``None`` without a model) and
+        ``results`` in input order, each with the observable's ``id`` and
+        its ``expectation`` in ``[-1, 1]``.
+
+        *observables* is a list or tuple of 1 to 100 mappings, each with
+        exactly the keys ``id`` (a non-empty string, unique within the
+        batch) and ``operators`` (a list or tuple of mappings with exactly
+        the keys ``qubit`` — a non-boolean integer inside the quantum
+        register, not repeated within one observable — and ``pauli``, one
+        of ``"X"``, ``"Y"``, ``"Z"``). An empty ``operators`` sequence is
+        the global identity. Measurement operations and the classical
+        register width do not take part in the computation.
+
+        Type mismatches raise :class:`TypeError`; value problems (wrong
+        count, unknown or missing keys, empty or duplicated ids, repeated
+        or out-of-range qubits, unknown Paulis) raise :class:`ValueError`,
+        and the whole batch is validated before any state is evolved.
+        Invalid noise models raise
+        :class:`~quantum_circuit.noise.NoiseModelError`; a noisy circuit
+        beyond the density-matrix qubit limit raises :class:`ValueError`.
+        Repeated calls with equal arguments return equal results, and
+        neither the circuit nor the input objects are ever modified.
+        """
+        parsed = _check_observables(observables, self._num_qubits)
+        model = self._prepare_noise_model(noise_model)
+        program = self._to_program()
+        try:
+            return run_expectation(program, parsed, model)
         except SimulationError as exc:
             raise ValueError(str(exc)) from None
 

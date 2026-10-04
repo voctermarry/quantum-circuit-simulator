@@ -23,6 +23,7 @@ from .core import (
     SimulationError,
     evolve_basis_probabilities,
     probability_payload,
+    run_expectation,
     run_probabilities,
     run_simulation,
     snap_probability,
@@ -55,10 +56,7 @@ from .metrics import (
 from .noise import MAX_NOISE_QUBITS, evolve_density_matrix
 from .observables import (
     ObservableError,
-    density_matrix_expectation,
     parse_observables,
-    snap_expectation,
-    state_vector_expectation,
 )
 from .optimizer import optimize as optimize_program
 from .simulator import simulate_state_vector, unitary_matrix
@@ -192,45 +190,10 @@ def expectation_task(
     observables: list[tuple[str, list[tuple[int, str]]]],
 ) -> dict[str, object]:
     """Evaluate every observable against the final (pre-measurement) state."""
-    if noise_model is None:
-        # The parser already caps the register at the 20-qubit
-        # state-vector limit.
-        state = simulate_state_vector(program)
-        results = [
-            {
-                "id": observable_id,
-                "expectation": snap_expectation(state_vector_expectation(state, operators)),
-            }
-            for observable_id, operators in observables
-        ]
-        return {
-            "schema_version": 1,
-            "num_qubits": program.num_qubits,
-            "noise_model": None,
-            "results": results,
-        }
-
-    if program.num_qubits > MAX_NOISE_QUBITS:
-        raise CommandFailure(
-            "simulation_error",
-            f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits, "
-            f"got {program.num_qubits}",
-            3,
-        ) from None
-    rho = normalized_density_matrix(evolve_density_matrix(program, noise_model))
-    results = [
-        {
-            "id": observable_id,
-            "expectation": snap_expectation(density_matrix_expectation(rho, operators)),
-        }
-        for observable_id, operators in observables
-    ]
-    return {
-        "schema_version": 1,
-        "num_qubits": program.num_qubits,
-        "noise_model": noise_model,
-        "results": results,
-    }
+    try:
+        return run_expectation(program, observables, noise_model)
+    except SimulationError as exc:
+        raise CommandFailure("simulation_error", str(exc), 3) from None
 
 
 def equivalent_task(left, right) -> dict[str, object]:
