@@ -1,11 +1,13 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "_release_build"
+backend-path = ["."]
 
 [project]
 name = "quantum-circuit-simulator"
 version = "0.1.0"
 description = "Quantum circuit construction, simulation and verification"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
