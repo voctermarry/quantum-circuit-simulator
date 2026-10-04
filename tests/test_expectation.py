@@ -15,7 +15,7 @@ import math
 
 import pytest
 
-from quantum_circuit import cli
+from quantum_circuit import cli, core
 from quantum_circuit.noise import evolve_density_matrix
 from quantum_circuit.observables import (
     density_matrix_expectation,
@@ -571,7 +571,7 @@ def test_observable_error_emitted_before_evolution(write_qasm, write_obs, monkey
     )
     # A 20-qubit state vector would be huge; validation must fail without it.
     with monkeypatch.context() as patched:
-        patched.setattr(cli, "simulate_state_vector", lambda program: pytest.fail("state evolved"))
+        patched.setattr(core, "simulate_state_vector", lambda program: pytest.fail("state evolved"))
         rc = cli.main(["expectation", qasm, obs])
     assert rc == 2
     assert json.loads(capsys.readouterr().err)["error"] == "observable_error"

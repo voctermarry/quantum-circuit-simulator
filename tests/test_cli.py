@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from quantum_circuit import __version__, cli
+from quantum_circuit import __version__, cli, documents
 
 HEADER = 'OPENQASM 2.0;\ninclude "qelib1.inc";\n'
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -946,12 +946,12 @@ def test_reconcile_ignores_key_order_and_whitespace(reconcile_env, capsys):
 
 
 def test_reconcile_array_order_and_number_type_are_significant():
-    assert cli._json_equal({"a": [1, 2]}, {"a": [1, 2]}) is True
-    assert cli._json_equal({"a": [1, 2]}, {"a": [2, 1]}) is False
-    assert cli._json_equal({"a": 1}, {"a": 1}) is True
-    assert cli._json_equal({"a": 1}, {"a": 1.0}) is False
-    assert cli._json_equal({"a": 1}, {"a": True}) is False
-    assert cli._json_equal({"x": 1, "y": 2}, {"y": 2, "x": 1}) is True
+    assert documents.json_equal({"a": [1, 2]}, {"a": [1, 2]}) is True
+    assert documents.json_equal({"a": [1, 2]}, {"a": [2, 1]}) is False
+    assert documents.json_equal({"a": 1}, {"a": 1}) is True
+    assert documents.json_equal({"a": 1}, {"a": 1.0}) is False
+    assert documents.json_equal({"a": 1}, {"a": True}) is False
+    assert documents.json_equal({"x": 1, "y": 2}, {"y": 2, "x": 1}) is True
 
 
 def test_reconcile_byte_identical_repeated_runs(reconcile_env, capsys):
