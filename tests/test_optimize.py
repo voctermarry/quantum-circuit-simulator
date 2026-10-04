@@ -108,10 +108,11 @@ def test_cancellation_sees_through_disjoint_gates():
 
 
 def test_shared_qubit_gate_between_blocks_cancellation():
-    # x; rx(0.5); x must remain because the rotation shares q[0].
-    _, changed, qasm = _optimize_body("x q[0];\nrx(0.5) q[0];\nx q[0];\n")
+    # x; ry(0.5); x must remain because the rotation shares q[0] and does
+    # not commute with x (only rx does).
+    _, changed, qasm = _optimize_body("x q[0];\nry(0.5) q[0];\nx q[0];\n")
     assert changed is False
-    assert _gate_lines(qasm) == ["x q[0];", "rx(0.5) q[0];", "x q[0];"]
+    assert _gate_lines(qasm) == ["x q[0];", "ry(0.5) q[0];", "x q[0];"]
 
 
 def test_cascading_cancellation_after_disjoint_gate_removed():

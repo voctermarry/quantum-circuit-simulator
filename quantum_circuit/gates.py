@@ -13,8 +13,9 @@ from here instead of maintaining its own name lists or matrices:
   :func:`single_qubit_unitary` / :func:`controlled_target_unitary`, so a
   gate has one mathematical definition on every path;
 * the optimizer (:mod:`quantum_circuit.optimizer`) uses the same registry
-  for inverse pairs, self-inverse gates, the swap symmetry and the
-  ``2*pi``/``4*pi`` rotation periods;
+  for inverse pairs, self-inverse gates, the swap symmetry, the
+  ``2*pi``/``4*pi`` rotation periods and the same-qubit commutation
+  relations (diagonal gates, Pauli gate with same-axis rotation);
 * resource estimation (:mod:`quantum_circuit.estimation`) uses the fixed
   gate-count orders below.
 
@@ -246,6 +247,36 @@ PHASE_FACTORS: Mapping[str, complex] = MappingProxyType(
     {name: spec.phase_factor for name, spec in GATE_SPECS.items() if spec.phase_factor is not None}
 )
 
+
+def _is_computational_diagonal(spec: GateSpec) -> bool:
+    """True when the gate's unitary is diagonal in the computational basis.
+
+    Fixed gates (single-qubit or the target-embedded unitary of a
+    controlled gate) are diagonal when their off-diagonal entries vanish;
+    rotations about z are diagonal, rotations about x or y are not.
+    """
+    if spec.axis is not None:
+        return spec.axis == "z"
+    if spec.unitary is None:
+        return False  # swap
+    return spec.unitary[1] == 0 and spec.unitary[2] == 0
+
+
+# Commutation relations the optimizer may exploit, derived from the gate
+# semantics above. Gates diagonal in the computational basis commute
+# whenever they share any qubit: z, s, sdg, t, tdg, rz plus the controlled
+# cz and crz (a controlled diagonal gate is itself diagonal). Additionally
+# a Pauli gate commutes with rotations about its own axis on the same
+# qubit: x with rx and y with ry (z with rz is already diagonal). Every
+# other shared-qubit pair keeps its dependency order.
+DIAGONAL_GATES = frozenset(
+    name for name, spec in GATE_SPECS.items() if _is_computational_diagonal(spec)
+)
+COMMUTING_PAIRS: tuple[frozenset[str], ...] = (
+    frozenset(("x", "rx")),
+    frozenset(("y", "ry")),
+)
+
 # Fixed gate-count order for the three estimation schema versions. The
 # schema_version 1 mapping keeps its historical six entries; version 2 adds
 # the controlled gates; version 3 adds the remaining fixed gates and swap.
@@ -350,10 +381,12 @@ def gate_qasm(
 
 
 __all__ = [
+    "COMMUTING_PAIRS",
     "CONTROLLED",
     "CONTROLLED_GATES",
     "CONTROLLED_ROTATION_GATES",
     "CONTROLLED_ROTATION_PERIOD",
+    "DIAGONAL_GATES",
     "GATE_NAMES",
     "GATE_ORDER_V1",
     "GATE_ORDER_V2",
