@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -567,3 +568,526 @@ def test_process_output_dash_exit_code(env):
     assert result.returncode == 1
     assert result.stdout == ""
     assert json.loads(result.stderr)["error"] == "output_error"
+
+
+# --------------------------------------------- file-identity conflict aliases
+#
+# The guard must recognize the *same file* under every path alias the
+# platform allows -- relative "."/".." spellings, redundant separators,
+# symbolic links (including chains and linked directories), Windows
+# junctions (same stat(2) identity as symlinks) and hard links -- while
+# never rejecting two genuinely distinct files, however similar.
+
+
+def _conflict(argv):
+    rc, out, err = _run_main(argv)
+    return rc, out, err
+
+
+def test_conflict_relative_dot_alias_of_absolute_input(env, monkeypatch):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    monkeypatch.chdir(tmp_path)
+    backup = Path(source).read_bytes()
+    rc, out, err = _conflict(["simulate", source, "--output", "./a.qasm"])
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+    assert err.count("\n") == 1
+    assert Path(source).read_bytes() == backup
+
+
+def test_conflict_dotdot_alias_from_nested_cwd(env, monkeypatch):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    monkeypatch.chdir(nested)
+    rc, _out, err = _conflict(
+        ["simulate", "../a.qasm", "--output", str(tmp_path / "nested/../a.qasm")]
+    )
+    assert rc == 2
+    assert json.loads(err)["error"] == "output_error"
+    assert Path(source).read_bytes() != ""  # untouched
+
+
+def test_conflict_redundant_separator_spellings(env):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    alias = str(tmp_path) + "//./a.qasm"
+    rc, _out, err = _conflict(["simulate", alias, "--output", source])
+    assert rc == 2
+    assert json.loads(err)["error"] == "output_error"
+
+
+def test_conflict_symlink_that_targets_the_input(env):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    link = tmp_path / "alias.qasm"
+    os.symlink(source, link)
+    backup = Path(source).read_bytes()
+    rc, out, err = _conflict(["simulate", source, "--output", str(link)])
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+    # The symlink itself is not replaced and its referent is untouched.
+    assert link.is_symlink()
+    assert Path(source).read_bytes() == backup
+
+
+def test_conflict_input_reached_through_symlink(env):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    link = tmp_path / "alias.qasm"
+    os.symlink(source, link)
+    rc, _out, err = _conflict(["simulate", str(link), "--output", source])
+    assert rc == 2
+    assert json.loads(err)["error"] == "output_error"
+    assert link.is_symlink()
+
+
+def test_conflict_symlink_chain(env):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    os.symlink(source, tmp_path / "one.qasm")
+    os.symlink(tmp_path / "one.qasm", tmp_path / "two.qasm")
+    rc, _out, err = _conflict(["simulate", str(tmp_path / "two.qasm"), "--output", source])
+    assert rc == 2
+    assert json.loads(err)["error"] == "output_error"
+
+
+def test_conflict_path_through_symlinked_directory(env):
+    tmp_path, qasm, _file, _json = env
+    real = tmp_path / "real"
+    real.mkdir()
+    source = real / "a.qasm"
+    source.write_text(HEADER + X_CIRCUIT, encoding="utf-8")
+    os.symlink(real, tmp_path / "linked")
+    rc, _out, err = _conflict(
+        ["simulate", str(tmp_path / "linked" / "a.qasm"), "--output", str(source)]
+    )
+    assert rc == 2
+    assert json.loads(err)["error"] == "output_error"
+
+
+def test_conflict_hard_link(env):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    hard = tmp_path / "hard.qasm"
+    try:
+        os.link(source, hard)
+    except OSError:
+        pytest.skip("hard links are not supported on this volume")
+    backup = Path(source).read_bytes()
+    rc, out, err = _conflict(["simulate", str(hard), "--output", source])
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+    assert Path(source).read_bytes() == backup
+    assert Path(hard).read_bytes() == backup
+
+
+def test_distinct_files_with_identical_content_are_not_conflicts(env):
+    tmp_path, qasm, _file, _json = env
+    first = qasm(X_CIRCUIT, "a.qasm")
+    second = qasm(X_CIRCUIT, "b.qasm")
+    rc, out, err = _conflict(
+        ["simulate", first, "--shots", "4", "--seed", "1", "--output", second]
+    )
+    assert (rc, out, err) == (0, "", "")
+    # The distinct target is overwritten with the result, as for any target.
+    assert json.loads(Path(second).read_text())["counts"] == {"1": 4}
+
+
+def test_similar_filenames_are_not_conflicts(env):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    target = qasm(X_CIRCUIT, "ab.qasm")
+    rc, out, err = _conflict(
+        ["simulate", source, "--shots", "2", "--seed", "1", "--output", target]
+    )
+    assert (rc, out, err) == (0, "", "")
+
+
+def test_export_through_symlinked_directory_to_a_new_file(env):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    real = tmp_path / "outdir"
+    real.mkdir()
+    os.symlink(real, tmp_path / "linkdir")
+    target = tmp_path / "linkdir" / "result.json"
+    rc, out, err = _conflict(
+        ["simulate", source, "--shots", "3", "--seed", "1", "--output", str(target)]
+    )
+    assert (rc, out, err) == (0, "", "")
+    assert (real / "result.json").is_file()
+
+
+OBSERVABLES = {
+    "schema_version": 1,
+    "observables": [{"id": "z", "operators": [{"qubit": 0, "pauli": "Z"}]}],
+}
+SAMPLES = {"schema_version": 1, "counts": {"0": 3, "1": 1}}
+
+
+@pytest.mark.parametrize(
+    "command,document",
+    [
+        ("probabilities", {"bit_flip": 0.2}),
+        ("expectation", OBSERVABLES),
+        ("verify-samples", SAMPLES),
+    ],
+)
+def test_conflict_auxiliary_input_reached_via_dot_alias(env, monkeypatch, command, document):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    _json(document, "doc.json")
+    monkeypatch.chdir(tmp_path)
+    extra = ["--noise-model", "doc.json"] if command == "probabilities" else []
+    argv = [command, source, *extra]
+    if command != "probabilities":
+        argv.append("doc.json")
+    rc, out, err = _conflict([*argv, "--output", "./doc.json"])
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+    assert json.loads(Path(tmp_path / "doc.json").read_text())  # valid JSON, untouched
+
+
+def test_conflict_state_metrics_noise_model_alias(env, monkeypatch):
+    tmp_path, qasm, _file, _json = env
+    left = qasm(X_CIRCUIT, "l.qasm")
+    right = qasm(X_CIRCUIT, "r.qasm")
+    _json({"bit_flip": 0.2}, "model.json")
+    monkeypatch.chdir(tmp_path)
+    rc, out, err = _conflict(
+        [
+            "state-metrics", left, right,
+            "--right-noise-model", "model.json",
+            "--output", "./model.json",
+        ]
+    )
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+
+
+def test_conflict_reconcile_baseline_alias(manifest_env, monkeypatch):
+    tmp_path, _qasm, _file, _json, manifest = manifest_env
+    _rc, batch_stdout, _err = _run_main(["batch-simulate", manifest])
+    _file(batch_stdout, "baseline.json")
+    monkeypatch.chdir(tmp_path)
+    rc, out, err = _conflict(
+        ["reconcile", "jobs.json", "./baseline.json", "--output", "baseline.json"]
+    )
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+
+
+def test_stdin_input_does_not_participate_in_identity_guard(env, monkeypatch):
+    import io
+
+    tmp_path, _qasm, _file, _json = env
+    target = str(tmp_path / "from_stdin.json")
+    monkeypatch.setattr(
+        cli.sys, "stdin", io.TextIOWrapper(io.BytesIO((HEADER + X_CIRCUIT).encode()))
+    )
+    rc, out, err = _conflict(["simulate", "-", "--shots", "4", "--seed", "1", "--output", target])
+    assert (rc, out, err) == (0, "", "")
+    assert json.loads(Path(target).read_text())["counts"] == {"1": 4}
+
+
+def test_conflict_still_covers_file_input_when_another_input_is_stdin(env, monkeypatch):
+    import io
+
+    tmp_path, qasm, _file, _json = env
+    qasm(X_CIRCUIT, "a.qasm")
+    samples = _json(SAMPLES, "samples.json")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli.sys, "stdin", io.TextIOWrapper(io.BytesIO((HEADER + X_CIRCUIT).encode()))
+    )
+    rc, out, err = _conflict(
+        ["verify-samples", "-", "samples.json", "--output", "./samples.json"]
+    )
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+    assert json.loads(Path(samples).read_text())["counts"] == SAMPLES["counts"]
+
+
+# --------------------------------------------------------- case folding behavior
+
+
+def _volume_folds_case(directory: Path) -> bool:
+    probe = directory / ".qcs-fold-probe"
+    try:
+        probe.write_text("x", encoding="utf-8")
+        return (directory / ".QCS-FOLD-PROBE").exists()
+    except OSError:
+        return False
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+@pytest.fixture
+def case_sensitive_dir(tmp_path):
+    if _volume_folds_case(tmp_path):
+        pytest.skip("the test temp volume folds letter case")
+    return tmp_path
+
+
+def test_case_only_spelling_is_distinct_on_case_sensitive_volume(case_sensitive_dir):
+    tmp = case_sensitive_dir
+    source = tmp / "a.qasm"
+    source.write_text(HEADER + X_CIRCUIT, encoding="utf-8")
+    target = tmp / "A.QASM"
+    rc, out, err = _conflict(
+        ["simulate", str(source), "--shots", "2", "--seed", "1", "--output", str(target)]
+    )
+    assert (rc, out, err) == (0, "", "")
+    # Two genuinely different files coexist after the export.
+    assert source.is_file() and target.is_file()
+    assert source.read_text().startswith("OPENQASM")
+    assert json.loads(target.read_text())["counts"] == {"1": 2}
+
+
+def _find_case_folding_dir():
+    roots = [tempfile.gettempdir(), "/mnt/c", "/mnt/d", "/Volumes"]
+    for root in roots:
+        if not os.path.isdir(root) or not os.access(root, os.W_OK):
+            continue
+        try:
+            directory = Path(tempfile.mkdtemp(prefix="qcs-ciprobe-", dir=root))
+        except OSError:
+            continue
+        if _volume_folds_case(directory):
+            return directory
+        import shutil
+
+        shutil.rmtree(directory, ignore_errors=True)
+    return None
+
+
+@pytest.fixture
+def case_insensitive_dir():
+    directory = _find_case_folding_dir()
+    if directory is None:
+        pytest.skip("no writable case-insensitive volume is available")
+    yield directory
+    import shutil
+
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def _write_qasm(path: Path, body: str = X_CIRCUIT) -> str:
+    path.write_text(HEADER + body, encoding="utf-8")
+    return str(path)
+
+
+def test_case_only_alias_conflicts_on_case_insensitive_volume(case_insensitive_dir):
+    d = case_insensitive_dir
+    source = Path(_write_qasm(d / "a.qasm"))
+    rc, out, err = _conflict(["simulate", str(source), "--output", str(d / "A.QASM")])
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+    # The folded spelling must not have been created as a separate file.
+    assert source.read_text().startswith("OPENQASM")
+    assert not (d / "A.QASM").exists() or source.stat().st_ino == (d / "A.QASM").stat().st_ino
+
+
+def test_case_only_input_alias_conflicts_on_case_insensitive_volume(case_insensitive_dir):
+    d = case_insensitive_dir
+    source = Path(_write_qasm(d / "a.qasm"))
+    backup = source.read_bytes()
+    # The input is spelled with different case than the name on disk; the
+    # output uses the on-disk spelling. Both resolve to the same inode.
+    rc, _out, err = _conflict(
+        ["simulate", str(d / "A.qasm"), "--output", str(d / "a.qasm")]
+    )
+    assert rc == 2
+    assert json.loads(err)["error"] == "output_error"
+    assert source.read_bytes() == backup
+
+
+def test_distinct_files_still_distinct_on_case_insensitive_volume(case_insensitive_dir):
+    d = case_insensitive_dir
+    first = Path(_write_qasm(d / "a.qasm"))
+    second = Path(_write_qasm(d / "b.qasm"))
+    rc, out, err = _conflict(
+        ["simulate", str(first), "--shots", "2", "--seed", "1", "--output", str(second)]
+    )
+    assert (rc, out, err) == (0, "", "")
+    assert json.loads(second.read_text())["counts"] == {"1": 2}
+
+
+def test_missing_declared_ref_case_alias_conflicts_on_insensitive_volume(
+    case_insensitive_dir,
+):
+    d = case_insensitive_dir
+    _write_qasm(d / "a.qasm")
+    manifest = d / "jobs.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "jobs": [
+                    {"id": "ok", "source": "a.qasm", "shots": 2, "seed": 1},
+                    {"id": "ghost", "source": "missing.qasm"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    target = d / "MISSING.QASM"
+    rc, out, err = _conflict(["batch-simulate", str(manifest), "--output", str(target)])
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+    assert not target.exists()
+
+
+# ------------------------------------ manifest references: aliases and absences
+
+
+def test_conflict_existing_manifest_reference_through_symlink(env):
+    tmp_path, qasm, _file, _json = env
+    source = qasm(X_CIRCUIT, "a.qasm")
+    manifest = _json(
+        {"schema_version": 1, "jobs": [{"id": "a", "source": "a.qasm", "shots": 2, "seed": 1}]},
+        "jobs.json",
+    )
+    link = tmp_path / "jobs-link.json"
+    os.symlink(manifest, link)
+    # The manifest reached through the link still declares the same a.qasm.
+    rc, _out, err = _conflict(["batch-simulate", str(link), "--output", source])
+    assert rc == 2
+    assert json.loads(err)["error"] == "output_error"
+
+
+def test_conflict_missing_reference_with_dotdot_normalization(env, monkeypatch):
+    tmp_path, qasm, _file, _json = env
+    qasm(X_CIRCUIT, "a.qasm")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    manifest = _json(
+        {
+            "schema_version": 1,
+            "jobs": [
+                {"id": "a", "source": "a.qasm", "shots": 2, "seed": 1},
+                {"id": "ghost", "source": "nested/../ghost.qasm"},
+            ],
+        },
+        "jobs.json",
+    )
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "ghost.qasm"
+    rc, out, err = _conflict(["batch-simulate", manifest, "--output", "./ghost.qasm"])
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+    assert not target.exists()
+
+
+def test_conflict_missing_reference_declared_by_stdin_manifest_uses_cwd(env, monkeypatch):
+    import io
+
+    tmp_path, qasm, _file, _json = env
+    qasm(X_CIRCUIT, "a.qasm")
+    manifest_text = json.dumps(
+        {"schema_version": 1, "jobs": [{"id": "ghost", "source": "ghost.qasm"}]}
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(manifest_text.encode())))
+    target = tmp_path / "ghost.qasm"
+    rc, out, err = _conflict(["batch-simulate", "-", "--output", "./ghost.qasm"])
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "output_error"
+    assert not target.exists()
+
+
+def test_missing_reference_with_distinct_similar_target_still_exports(env):
+    tmp_path, qasm, _file, _json = env
+    qasm(X_CIRCUIT, "a.qasm")
+    manifest = _json(
+        {"schema_version": 1, "jobs": [{"id": "ghost", "source": "ghost.qasm"}]},
+        "jobs.json",
+    )
+    target = tmp_path / "ghost2.qasm"
+    rc, out, err = _conflict(["batch-simulate", manifest, "--output", str(target)])
+    # No conflict: the failing task is embedded and the report exports with 3.
+    assert rc == 3 and out == "" and err == ""
+    report = json.loads(target.read_text())
+    assert report["failed"] == 1
+
+
+def test_missing_reference_declared_through_symlinked_manifest_dir(env, monkeypatch):
+    tmp_path, qasm, _file, _json = env
+    real = tmp_path / "real"
+    real.mkdir()
+    qasm_path = real / "a.qasm"
+    qasm_path.write_text(HEADER + X_CIRCUIT, encoding="utf-8")
+    (real / "jobs.json").write_text(
+        json.dumps(
+            {"schema_version": 1, "jobs": [{"id": "ghost", "source": "ghost.qasm"}]}
+        ),
+        encoding="utf-8",
+    )
+    os.symlink(real, tmp_path / "alias")
+    monkeypatch.chdir(tmp_path)
+    # The declared path follows the same manifest-dir alias the open() call
+    # would use, so the normalized lexical spellings must match.
+    target_alias = "alias/ghost.qasm"
+    rc, _out, err = _conflict(
+        ["batch-simulate", "alias/jobs.json", "--output", target_alias]
+    )
+    assert rc == 2
+    assert json.loads(err)["error"] == "output_error"
+    assert not (real / "ghost.qasm").exists()
+
+
+def test_existing_guard_error_precedence_unchanged_with_aliased_conflict(env):
+    # A bad circuit reports parse_error (exit 2) even though the same
+    # invocation also names the source as the output via an alias.
+    tmp_path, _qasm, _file, _json = env
+    bad = tmp_path / "bad.qasm"
+    bad.write_text(HEADER + "qreg q[1];\ncreg c[1];\nx q[0]\n", encoding="utf-8")
+    rc, out, err = _run_main(["simulate", str(bad), "--output", "./bad.qasm"])
+    assert rc == 2 and out == ""
+    assert json.loads(err)["error"] == "parse_error"
+
+
+# ------------------------------------------------------------- unit-level rules
+
+
+def test_registered_existing_input_compared_by_identity(tmp_path):
+    from quantum_circuit.delivery import RunContext, output_conflict
+
+    source = tmp_path / "a.qasm"
+    source.write_text("input", encoding="utf-8")
+    link = tmp_path / "a-link.qasm"
+    os.symlink(source, link)
+
+    ctx = RunContext(str(link))
+    ctx.register_input(str(source))
+    failure = output_conflict(ctx)
+    assert failure is not None
+    assert (failure.error, failure.exit_code) == ("output_error", 2)
+
+
+def test_declared_nonexistent_input_compared_lexically(tmp_path):
+    from quantum_circuit.delivery import RunContext, output_conflict
+
+    ctx = RunContext(str(tmp_path / "nested/../ghost.qasm"))
+    ctx.register_declared("ghost.qasm", str(tmp_path))
+    failure = output_conflict(ctx)
+    assert failure is not None and failure.error == "output_error"
+
+    ctx = RunContext(str(tmp_path / "other.qasm"))
+    ctx.register_declared("ghost.qasm", str(tmp_path))
+    assert output_conflict(ctx) is None
+
+
+def test_stdin_is_never_registered(tmp_path):
+    from quantum_circuit.delivery import RunContext, output_conflict
+
+    ctx = RunContext(str(tmp_path / "out.json"))
+    ctx.register_input("-")
+    ctx.register_declared("-")
+    assert output_conflict(ctx) is None
+
