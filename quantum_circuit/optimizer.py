@@ -7,18 +7,29 @@ keeping the measurement layout (qubit-to-clbit mapping) intact:
 * adjacent ``x``/``x``, ``h``/``h``, ``y``/``y``, ``z``/``z`` and
   ``swap``/``swap`` pairs, ``cx``/``cz`` pairs with identical control and
   target, and inverse pairs ``s``/``sdg`` and ``t``/``tdg`` on the same
-  qubit cancel ("adjacent" allows intervening gates on disjoint qubits);
+  qubit cancel ("adjacent" allows intervening gates on disjoint qubits, or
+  intervening gates that commute on the shared qubit -- see below);
 * consecutive same-axis ``rx``/``ry``/``rz`` rotations on one qubit merge
   into a single rotation, as do consecutive same-axis ``crx``/``cry``/``crz``
   rotations with identical control and target;
 * rotations whose normalized angle has magnitude at most ``1e-12`` are
   deleted;
-* gates acting on disjoint qubits are moved past each other until the
-  sequence is sorted by a stable key (minimum qubit, maximum qubit, gate
-  name and parameter text).
+* gates acting on disjoint qubits are moved past each other, and so are a
+  fixed set of same-qubit commuting pairs: ``x`` with ``rx``, ``y`` with
+  ``ry``, and any two computational-basis-diagonal gates
+  (``z``/``s``/``sdg``/``t``/``tdg``/``rz``/``cz``/``crz``). Gates are
+  sorted by a stable key (minimum qubit, maximum qubit, gate name and
+  parameter text).
+
+Cancellations and merges therefore reach across any number of commuting
+gates (two ``x`` gates separated by an ``rx``, ``s``/``sdg`` separated by a
+``cz``, two ``rz`` rotations separated by a single-qubit diagonal gate).
+Every other shared-qubit pair keeps its dependency order; the operand
+orientation of directed gates (``cx``/``cz``/``crx``/``cry``/``crz``) is
+never rewritten.
 
 Simplification passes repeat until the sequence reaches a fixed point, so
-inputs that differ only in the ordering of independent gates produce
+inputs that differ only in the ordering of interchangeable gates produce
 byte-identical output. Single-qubit rotation angles are normalized to
 ``(-pi, pi]`` (rendering a value at either boundary as ``pi`` when it is
 positive). Controlled rotations are normalized to ``(-2*pi, 2*pi]`` instead:
@@ -39,6 +50,7 @@ from .gates import (
     ROTATION_GATES,
     SELF_INVERSE_GATES,
     Operation,
+    commute_group,
     format_angle,
     gate_qasm,
 )
@@ -68,6 +80,18 @@ class Gate:
     @property
     def qubit_set(self) -> frozenset[int]:
         return frozenset(self.qubits)
+
+    @property
+    def commute_group(self) -> str | None:
+        """Same-qubit commutation group label, or ``None`` for no crossing.
+
+        Two gates that share a qubit and carry the same label may change
+        places (``x``/``rx``, ``y``/``ry`` and the diagonal family); a gate
+        with ``None`` keeps its dependency order against every shared-qubit
+        gate, and gates with different labels keep theirs against each
+        other.
+        """
+        return commute_group(self.kind)
 
 
 def normalize_angle(angle: float) -> float:
@@ -115,8 +139,10 @@ def _gate_from_operation(op: Operation) -> Gate:
 
 
 def _sort_key(gate: Gate) -> tuple[int, int, str, str]:
-    # Ties (including two commuting gates on the same set, e.g. rz/rx) keep
-    # their relative order, which is the dependency order the semantics need.
+    # Canonical order of mutually interchangeable gates: minimum qubit,
+    # maximum qubit, gate name, then parameter text. Gates that may not cross
+    # never become simultaneously ready, so the key only orders independent
+    # gates (disjoint qubits or one shared commutation group).
     parameter = _format_angle(gate.angle) if gate.angle is not None else ""
     return (min(gate.qubits), max(gate.qubits), gate.kind, parameter)
 
@@ -165,15 +191,30 @@ def _is_identity_rotation(gate: Gate) -> bool:
     )
 
 
+def _crosses(left: Gate, right: Gate) -> bool:
+    """Whether *right* may move left across *left* though they share a qubit.
+
+    This is exactly the recognized same-qubit commutation relation: both
+    gates belong to the same named commutation group. Disjoint gates are
+    handled by the callers (they never constrain one another); every other
+    shared-qubit pair is immovable.
+    """
+    group = left.commute_group
+    return group is not None and group == right.commute_group
+
+
 def _simplify_once(gates: list[Gate]) -> list[Gate] | None:
     """Run one simplification sweep.
 
-    Scans left to right; whenever a gate can cancel or merge with the
-    nearest preceding gate that shares a qubit (gates between them acting on
-    disjoint qubits are ignored), the rewrite is performed and the scan
-    restarts so the newly adjacent gates become visible. Identity rotations
-    are dropped on sight. Returns the rewritten list, or ``None`` when no
-    rewrite was possible.
+    Scans left to right; whenever a gate can cancel or merge with a
+    preceding gate that shares a qubit, the rewrite is performed and the
+    scan restarts so the newly adjacent gates become visible. Gates between
+    the two are ignored when each of them may be crossed: it acts on
+    disjoint qubits, or it shares a qubit but belongs to the same
+    commutation group (``x``/``rx``, ``y``/``ry`` or two diagonal gates).
+    The first gate that genuinely blocks the pair stops the look-back.
+    Identity rotations are dropped on sight. Returns the rewritten list,
+    or ``None`` when no rewrite was possible.
     """
     for index in range(len(gates)):
         gate = gates[index]
@@ -188,6 +229,10 @@ def _simplify_once(gates: list[Gate]) -> list[Gate] | None:
                 merged = _merge(previous, gate)
                 if merged is not None:
                     return gates[:earlier] + [merged] + gates[earlier + 1 : index] + gates[index + 1 :]
+                if _crosses(previous, gate):
+                    # Commuting shared-qubit gate: slide the look-back past
+                    # it; the pair sought may cancel/merge further left.
+                    continue
                 break
     return None
 
@@ -195,46 +240,90 @@ def _simplify_once(gates: list[Gate]) -> list[Gate] | None:
 def _canonical_order(gates: list[Gate]) -> list[Gate]:
     """Return *gates* in canonical order.
 
-    Builds the dependency DAG in which each gate depends on the latest
-    preceding gate touching any of the same qubits (so gates on disjoint
-    qubits are mutually independent), then takes the unique linear
-    extension that minimizes :func:`_sort_key` among all available gates at
-    each step. That extension is independent of how independent gates were
-    written, which is what makes reordering canonical.
+    Builds the dependency DAG of the partial order "must stay before": gate
+    *u* must precede a later gate *v* when they share a qubit and may not
+    cross, i.e. they are not in the same named commutation group (a gate
+    without a group blocks every shared-qubit gate, including another one).
+    Gates on disjoint qubits and same-group gates on a shared qubit are
+    mutually independent.
+
+    On one qubit the gates split into runs: a maximal stretch of gates with
+    one shared non-empty commutation label. Gates inside a run are mutually
+    interchangeable; a gate without a label always starts a singleton run.
+    A run as a whole must precede the next run on the qubit: e.g. for
+    ``z s x`` both diagonal gates must be emitted before the ``x`` even
+    though ``z`` and ``s`` carry no order between them. Two-qubit gates take
+    part in one run on every qubit they touch and wait on each.
+
+    The runs are synchronized by completion barriers in linear time: a gate
+    is ready once the predecessor run on each qubit it touches is fully
+    emitted; completing a run opens its single successor. Among all ready
+    gates the smallest :func:`_sort_key` is emitted, which makes the result
+    independent of how interchangeable gates were written.
     """
     count = len(gates)
-    # predecessors[i]: gates that must precede gate i (share a qubit and come
-    # earlier in the source). Only the latest such gate per qubit is needed:
-    # transitively it already requires everything before it.
-    predecessors: list[set[int]] = [set() for _ in range(count)]
-    last_on_qubit: dict[int, int] = {}
+
+    # Build the per-qubit runs. Each run has one qubit owner and a single
+    # predecessor (the previous run on that qubit); a gate records every
+    # run it belongs to (one per operand).
+    run_members: list[list[int]] = []
+    run_prev: list[int | None] = []
+    gate_runs: list[list[int]] = [[] for _ in range(count)]
+    # qubit -> (id of its latest run, label of that run's gates)
+    last_run_on_qubit: dict[int, tuple[int, str | None]] = {}
     for index, gate in enumerate(gates):
+        group = gate.commute_group
         for qubit in gate.qubits:
-            if qubit in last_on_qubit:
-                predecessors[index].add(last_on_qubit[qubit])
-            last_on_qubit[qubit] = index
+            state = last_run_on_qubit.get(qubit)
+            if state is not None:
+                previous_run, previous_group = state
+                if group is not None and group == previous_group:
+                    run_id = previous_run
+                else:
+                    run_id = len(run_members)
+                    run_members.append([])
+                    run_prev.append(previous_run)
+            else:
+                run_id = len(run_members)
+                run_members.append([])
+                run_prev.append(None)
+            run_members[run_id].append(index)
+            gate_runs[index].append(run_id)
+            last_run_on_qubit[qubit] = (run_id, group)
 
-    remaining = [len(preds) for preds in predecessors]
-    dependents: list[list[int]] = [[] for _ in range(count)]
-    for index, preds in enumerate(predecessors):
-        for pred in preds:
-            dependents[pred].append(index)
+    run_next: dict[int, int] = {}
+    for run_id, predecessor in enumerate(run_prev):
+        if predecessor is not None:
+            run_next[predecessor] = run_id
 
-    # Heap entries break key ties by original position, preserving the
-    # relative (dependency) order of gates that the sort key cannot separate.
-    ready: list[tuple[tuple, int]] = [
-        (_sort_key(gates[index]), index) for index in range(count) if remaining[index] == 0
-    ]
-    heapq.heapify(ready)
+    # A gate carries one barrier per operand whose run is not first on its
+    # qubit; a barrier is removed when that run's predecessor drains, so the
+    # gate becomes ready only after the preceding run on *every* touched
+    # qubit has fully emitted.
+    remaining = [0] * count
+    run_remaining = [len(members) for members in run_members]
+    ready: list[tuple[tuple, int]] = []
+    for index, run_ids in enumerate(gate_runs):
+        blocked = sum(1 for run_id in run_ids if run_prev[run_id] is not None)
+        remaining[index] = blocked
+        if blocked == 0:
+            heapq.heappush(ready, (_sort_key(gates[index]), index))
 
     ordered: list[Gate] = []
     while ready:
         _, index = heapq.heappop(ready)
         ordered.append(gates[index])
-        for dependent in dependents[index]:
-            remaining[dependent] -= 1
-            if remaining[dependent] == 0:
-                heapq.heappush(ready, (_sort_key(gates[dependent]), dependent))
+        for run_id in gate_runs[index]:
+            run_remaining[run_id] -= 1
+            if run_remaining[run_id] != 0:
+                continue
+            successor = run_next.get(run_id)
+            if successor is None:
+                continue
+            for member in run_members[successor]:
+                remaining[member] -= 1
+                if remaining[member] == 0:
+                    heapq.heappush(ready, (_sort_key(gates[member]), member))
     return ordered
 
 

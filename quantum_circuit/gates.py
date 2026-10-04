@@ -40,6 +40,14 @@ SWAP = "swap"
 ROTATION_PERIOD = 2.0 * math.pi
 CONTROLLED_ROTATION_PERIOD = 4.0 * math.pi
 
+# Same-qubit commutation classes (see :class:`GateSpec.commute_class`).
+# ``x``/``rx`` and ``y``/``ry`` each share an axis and therefore commute;
+# every computational-basis-diagonal gate belongs to the diagonal class,
+# which is derived from the unitary rather than named on each spec.
+COMMUTE_CLASS_PAULI_X = "pauli-x"
+COMMUTE_CLASS_PAULI_Y = "pauli-y"
+COMMUTE_CLASS_DIAGONAL = "diagonal"
+
 _SQRT1_2 = 2.0**-0.5
 
 
@@ -64,6 +72,10 @@ class GateSpec:
         self_inverse: whether two adjacent applications on the same qubits
             cancel.
         symmetric: whether the two operands are unordered (only ``swap``).
+        commute_class: optional same-qubit commutation group. Gates sharing
+            the label commute whenever they share a qubit (``x``/``rx`` and
+            ``y``/``ry``). Computational-basis-diagonal gates carry the
+            shared diagonal label via :attr:`is_diagonal` rather than here.
     """
 
     name: str
@@ -75,6 +87,7 @@ class GateSpec:
     inverse_name: str | None = None
     self_inverse: bool = False
     symmetric: bool = False
+    commute_class: str | None = None
 
     @property
     def num_operands(self) -> int:
@@ -85,6 +98,25 @@ class GateSpec:
     def is_controlled(self) -> bool:
         """True for directed gates whose first operand is the control."""
         return self.style == CONTROLLED
+
+    @property
+    def is_diagonal(self) -> bool:
+        """True for gates diagonal in the computational basis.
+
+        Such gates share one commutation group: any two of them commute on
+        every shared qubit. Single-qubit diagonal gates are the phase gates
+        and the z rotation; a controlled gate is diagonal when its embedded
+        target unitary is diagonal (``cz``) or its axis is ``z`` (``crz``),
+        while ``cx``/``crx``/``cry`` flip the target and are not.
+        """
+        if self.style == SINGLE_QUBIT:
+            return self.phase_factor is not None or self.axis == "z"
+        if self.style == CONTROLLED:
+            if self.axis is not None:
+                return self.axis == "z"
+            assert self.unitary is not None
+            return self.unitary[1] == 0j and self.unitary[2] == 0j
+        return False  # swap permutes basis states
 
     @property
     def rotation_period(self) -> float | None:
@@ -171,9 +203,15 @@ def _phase_factor(matrix: tuple[complex, complex, complex, complex]) -> complex:
 
 _SPECS: tuple[GateSpec, ...] = (
     # Fixed single-qubit gates.
-    GateSpec("x", SINGLE_QUBIT, unitary=_UNITARY_X, self_inverse=True),
+    GateSpec(
+        "x", SINGLE_QUBIT, unitary=_UNITARY_X, self_inverse=True,
+        commute_class=COMMUTE_CLASS_PAULI_X,
+    ),
     GateSpec("h", SINGLE_QUBIT, unitary=_UNITARY_H, self_inverse=True),
-    GateSpec("y", SINGLE_QUBIT, unitary=_UNITARY_Y, self_inverse=True),
+    GateSpec(
+        "y", SINGLE_QUBIT, unitary=_UNITARY_Y, self_inverse=True,
+        commute_class=COMMUTE_CLASS_PAULI_Y,
+    ),
     GateSpec(
         "z", SINGLE_QUBIT, unitary=_UNITARY_Z,
         phase_factor=_phase_factor(_UNITARY_Z), self_inverse=True,
@@ -194,9 +232,17 @@ _SPECS: tuple[GateSpec, ...] = (
         "tdg", SINGLE_QUBIT, unitary=_UNITARY_TDG,
         phase_factor=_phase_factor(_UNITARY_TDG), inverse_name="t",
     ),
-    # Single-qubit angle rotations.
-    GateSpec("rx", SINGLE_QUBIT, parameterized=True, axis="x"),
-    GateSpec("ry", SINGLE_QUBIT, parameterized=True, axis="y"),
+    # Single-qubit angle rotations. Only the single-qubit x/y rotations
+    # join the Pauli commutation groups; crx/cry are deliberately excluded
+    # (the optimizer recognizes only the explicitly allowed relationships).
+    GateSpec(
+        "rx", SINGLE_QUBIT, parameterized=True, axis="x",
+        commute_class=COMMUTE_CLASS_PAULI_X,
+    ),
+    GateSpec(
+        "ry", SINGLE_QUBIT, parameterized=True, axis="y",
+        commute_class=COMMUTE_CLASS_PAULI_Y,
+    ),
     GateSpec("rz", SINGLE_QUBIT, parameterized=True, axis="z"),
     # Directed controlled gates (operands are control then target).
     GateSpec("cx", CONTROLLED, unitary=_UNITARY_X, self_inverse=True),
@@ -246,6 +292,21 @@ PHASE_FACTORS: Mapping[str, complex] = MappingProxyType(
     {name: spec.phase_factor for name, spec in GATE_SPECS.items() if spec.phase_factor is not None}
 )
 
+# Same-qubit commutation groups, all derived from the specs. Two gates in
+# one group commute on every qubit they share, so a canonicalizer may move
+# them past each other; every other shared-qubit pair keeps its dependency
+# order. The diagonal group is z/s/sdg/t/tdg/rz plus the computational-basis
+# diagonal two-qubit gates cz/crz.
+COMMUTING_X_GATES = frozenset(
+    name for name, spec in GATE_SPECS.items()
+    if spec.commute_class == COMMUTE_CLASS_PAULI_X
+)
+COMMUTING_Y_GATES = frozenset(
+    name for name, spec in GATE_SPECS.items()
+    if spec.commute_class == COMMUTE_CLASS_PAULI_Y
+)
+DIAGONAL_GATES = frozenset(name for name, spec in GATE_SPECS.items() if spec.is_diagonal)
+
 # Fixed gate-count order for the three estimation schema versions. The
 # schema_version 1 mapping keeps its historical six entries; version 2 adds
 # the controlled gates; version 3 adds the remaining fixed gates and swap.
@@ -261,6 +322,21 @@ MEASURE = "measure"
 def gate_spec(name: str) -> GateSpec:
     """Return the immutable spec of *name* (a canonical gate name)."""
     return GATE_SPECS[name]
+
+
+def commute_group(name: str) -> str | None:
+    """Return the same-qubit commutation group label of gate *name*.
+
+    Gates that share a label commute on every shared qubit: the explicit
+    Pauli x/y groups and the derived diagonal group. ``None`` means the gate
+    may not cross another gate that shares a qubit with it.
+    """
+    spec = GATE_SPECS[name]
+    if spec.commute_class is not None:
+        return spec.commute_class
+    if spec.is_diagonal:
+        return COMMUTE_CLASS_DIAGONAL
+    return None
 
 
 def gate_operation(
@@ -350,10 +426,16 @@ def gate_qasm(
 
 
 __all__ = [
+    "COMMUTING_X_GATES",
+    "COMMUTING_Y_GATES",
     "CONTROLLED",
     "CONTROLLED_GATES",
     "CONTROLLED_ROTATION_GATES",
     "CONTROLLED_ROTATION_PERIOD",
+    "COMMUTE_CLASS_DIAGONAL",
+    "COMMUTE_CLASS_PAULI_X",
+    "COMMUTE_CLASS_PAULI_Y",
+    "DIAGONAL_GATES",
     "GATE_NAMES",
     "GATE_ORDER_V1",
     "GATE_ORDER_V2",
@@ -373,6 +455,7 @@ __all__ = [
     "SINGLE_QUBIT_GATES",
     "SWAP",
     "SWAP_GATES",
+    "commute_group",
     "controlled_target_unitary",
     "format_angle",
     "gate_operation",

@@ -171,10 +171,13 @@ def _merging_pair(rng: random.Random, n: int) -> list[str]:
 
 
 def _noncommuting_pair(rng: random.Random, n: int) -> list[str]:
-    """Two different shared-qubit gates: they may neither cancel nor merge."""
-    first_kind, second_kind = rng.sample(
-        ("x", "h", "y", "z", "s", "t", "rx", "ry", "rz"), 2
-    )
+    """Two different shared-qubit gates: they may neither cancel nor merge.
+
+    The pool is pairwise non-commuting under every recognized same-qubit
+    relation (none of x/h/y/s belong to one another's commutation groups),
+    so sampled pairs keep their dependency order through the optimizer.
+    """
+    first_kind, second_kind = rng.sample(("x", "h", "y", "s"), 2)
 
     def line(kind: str, qubit: int) -> str:
         if kind in ROTATION_KINDS:

@@ -107,11 +107,22 @@ def test_cancellation_sees_through_disjoint_gates():
     assert "cx q[1],q[2];" in qasm
 
 
-def test_shared_qubit_gate_between_blocks_cancellation():
-    # x; rx(0.5); x must remain because the rotation shares q[0].
+def test_commuting_shared_qubit_gate_between_blocks_cancels():
+    # x and rx commute on q[0], so the two x gates cancel across the rx.
     _, changed, qasm = _optimize_body("x q[0];\nrx(0.5) q[0];\nx q[0];\n")
+    assert changed is True
+    assert _gate_lines(qasm) == ["rx(0.5) q[0];"]
+
+
+def test_noncommuting_shared_qubit_gate_between_blocks_blocks():
+    # y/rx do not share a commutation relation, so the pair stays ordered.
+    _, changed, qasm = _optimize_body("y q[0];\nrx(0.5) q[0];\ny q[0];\n")
     assert changed is False
-    assert _gate_lines(qasm) == ["x q[0];", "rx(0.5) q[0];", "x q[0];"]
+    assert _gate_lines(qasm) == ["y q[0];", "rx(0.5) q[0];", "y q[0];"]
+    # A diagonal gate between two x gates blocks as well.
+    _, changed, qasm = _optimize_body("x q[0];\ns q[0];\nx q[0];\n")
+    assert changed is False
+    assert _gate_lines(qasm) == ["x q[0];", "s q[0];", "x q[0];"]
 
 
 def test_cascading_cancellation_after_disjoint_gate_removed():
@@ -184,6 +195,140 @@ def test_two_rotations_summing_to_zero_disappear():
     _, changed, qasm = _optimize_body("ry(0.6123) q[0];\nry(-0.6123) q[0];\n")
     assert changed is True
     assert _gate_lines(qasm) == []
+
+
+# ---------------------------------------------------- same-qubit commuting rules
+
+
+def test_x_pair_cancels_across_rx():
+    _, changed, qasm = _optimize_body("x q[0];\nrx(0.5) q[0];\nx q[0];\n", qreg="q[1]", creg="c[1]")
+    assert changed is True
+    assert _gate_lines(qasm) == ["rx(0.5) q[0];"]
+
+
+def test_y_pair_cancels_across_ry():
+    _, changed, qasm = _optimize_body(
+        "y q[0];\nry(0.25) q[0];\ny q[0];\n", qreg="q[1]", creg="c[1]"
+    )
+    assert changed is True
+    assert _gate_lines(qasm) == ["ry(0.25) q[0];"]
+
+
+def test_diagonal_inverse_pair_cancels_across_diagonal_gates():
+    # s / sdg cancel across any number of diagonal gates (here z and t).
+    body = "s q[0];\nz q[0];\nt q[0];\nsdg q[0];\n"
+    _, changed, qasm = _optimize_body(body, qreg="q[1]", creg="c[1]")
+    assert changed is True
+    assert _gate_lines(qasm) == ["t q[0];", "z q[0];"]
+
+
+def test_s_sdg_cancel_across_cz():
+    # The diagonal family includes the two-qubit cz gate on a shared qubit.
+    body = "s q[0];\ncz q[0],q[1];\nsdg q[0];\n"
+    _, changed, qasm = _optimize_body(body)
+    assert changed is True
+    assert _gate_lines(qasm) == ["cz q[0],q[1];"]
+
+
+def test_t_tdg_cancel_across_rz_on_other_target():
+    # t on q[1] separated from tdg q[1] by an rz on q[1] (both diagonal).
+    body = "t q[1];\nrz(0.4) q[1];\ntdg q[1];\n"
+    _, changed, qasm = _optimize_body(body)
+    assert changed is True
+    assert _gate_lines(qasm) == ["rz(0.4) q[1];"]
+
+
+def test_same_axis_rz_merges_across_single_qubit_diagonal_gate():
+    body = "rz(0.3) q[0];\ns q[0];\nrz(0.4) q[0];\n"
+    _, changed, qasm = _optimize_body(body, qreg="q[1]", creg="c[1]")
+    assert changed is True
+    assert _gate_lines(qasm) == ["rz(0.7) q[0];", "s q[0];"]
+
+
+def test_same_target_crz_merges_across_cz():
+    # crz and cz are both diagonal; the two crz rotations share control and
+    # target and merge across the cz, which then stays.
+    body = "crz(0.3) q[0],q[1];\ncz q[0],q[1];\ncrz(0.4) q[0],q[1];\n"
+    _, changed, qasm = _optimize_body(body, qreg="q[2]", creg="c[2]")
+    assert changed is True
+    assert _gate_lines(qasm) == ["crz(0.7) q[0],q[1];", "cz q[0],q[1];"]
+
+
+def test_cancellation_reaches_across_many_commuting_gates():
+    # Two z gates cancel across a chain of three other diagonal gates.
+    body = "z q[0];\ns q[0];\nt q[0];\nrz(0.12) q[0];\nz q[0];\n"
+    _, changed, qasm = _optimize_body(body, qreg="q[1]", creg="c[1]")
+    assert changed is True
+    assert _gate_lines(qasm) == ["rz(0.12) q[0];", "s q[0];", "t q[0];"]
+
+
+def test_cross_group_shared_qubit_gates_do_not_reorder():
+    # x vs a diagonal s gate on the same qubit are not in one group: no
+    # crossing, even though each has its own commuting family.
+    for body in (
+        "x q[0];\ns q[0];\n",
+        "s q[0];\nx q[0];\n",
+        "rx(0.5) q[0];\ny q[0];\n",
+        "rz(0.5) q[0];\nx q[0];\n",
+    ):
+        _, changed, qasm = _optimize_body(body, qreg="q[1]", creg="c[1]")
+        assert changed is False
+        assert _gate_lines(qasm) == body.splitlines()
+
+
+def test_commuting_gate_multiset_permutations_converge_byte_identically():
+    import itertools
+
+    multiset = ["s q[0];", "z q[0];", "t q[0];", "cz q[0],q[1];"]
+    outputs = set()
+    for order in itertools.permutations(multiset):
+        body = "\n".join(order) + "\n"
+        program = parse(HEADER + "qreg q[2];\ncreg c[2];\n" + body)
+        outputs.add(optimize(program)[2])
+    assert outputs == {
+        HEADER
+        + "qreg q[2];\ncreg c[2];\n"
+        + "s q[0];\nt q[0];\nz q[0];\ncz q[0],q[1];\n"
+    }
+
+
+def test_x_rx_permutations_converge_byte_identically():
+    outputs = set()
+    for body in ("x q[0];\nrx(0.5) q[0];\n", "rx(0.5) q[0];\nx q[0];\n"):
+        program = parse(HEADER + "qreg q[1];\ncreg c[1];\n" + body)
+        outputs.add(optimize(program)[2])
+    assert outputs == {
+        HEADER + "qreg q[1];\ncreg c[1];\nrx(0.5) q[0];\nx q[0];\n"
+    }
+
+
+def test_directed_cz_and_crz_keep_operand_orientation_across_commutation():
+    # Diagonal commutation must not canonicalize operand direction.
+    body = "crz(0.3) q[1],q[0];\ncz q[0],q[1];\ncrz(0.4) q[1],q[0];\n"
+    _, changed, qasm = _optimize_body(body, qreg="q[2]", creg="c[2]")
+    assert changed is True
+    lines = _gate_lines(qasm)
+    assert lines == ["crz(0.7) q[1],q[0];", "cz q[0],q[1];"]
+
+
+def test_commuting_rewrites_keep_equivalence_and_fixed_point():
+    body = (
+        "x q[0];\nrx(0.5) q[0];\nx q[0];\n"
+        "s q[0];\ncz q[0],q[1];\nsdg q[0];\n"
+        "rz(0.3) q[1];\nt q[1];\nrz(0.4) q[1];\n"
+        "y q[2];\nry(0.2) q[2];\ny q[2];\n"
+        "measure q[0] -> c[2];\nmeasure q[1] -> c[0];\nmeasure q[2] -> c[1];\n"
+    )
+    program = parse(HEADER + "qreg q[3];\ncreg c[3];\n" + body)
+    gates, changed, qasm = optimize(program)
+    assert changed is True
+    optimized = parse(qasm)
+    assert unitary_distance(unitary_matrix(program), unitary_matrix(optimized)) <= 1e-10
+    assert measurement_layout(program) == measurement_layout(optimized)
+    again_gates, again_changed, again_qasm = optimize(optimized)
+    assert again_qasm == qasm
+    assert again_gates == gates
+    assert again_changed is False
 
 
 # -------------------------------------------------------------- canonical order
