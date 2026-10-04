@@ -20,20 +20,46 @@ import tempfile
 from .errors import CommandFailure
 
 
+def _file_identity(path: str) -> tuple[int, int] | None:
+    """Return the ``(device, inode)`` identity of *path*, or ``None``.
+
+    :func:`os.stat` follows symbolic links (and Windows directory
+    junctions), so every alias of the same underlying file -- links, hard
+    links, junctions, ``.``/``..`` spellings -- yields the same identity.
+    A path that does not exist or cannot be stat'ed has no identity.
+    """
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
 class RunContext:
     """Track the optional ``--output PATH`` target and every input file read.
 
     The target is absolutized once (anchored at the invocation working
     directory). Every non-stdin input the command reads is registered using
-    the same path resolution used to open it, so an export that would
-    overwrite a reproducibility input can be refused before any result is
-    computed.
+    the same path resolution used to open it, in two forms:
+
+    * a lexically normalized spelling (``normcase`` of the absolute path),
+      so ``.``/``..`` spellings always collide and case-only differences
+      collide exactly on case-insensitive file systems -- this also covers
+      manifest-declared paths that do not exist (yet); and
+    * the actual file identity when the file exists, so any alias of the
+      same file (symbolic links, hard links, junctions) is recognized.
+
+    An export that would overwrite a reproducibility input can therefore
+    be refused before any result is computed, while two genuinely
+    different files -- however similar their names or contents -- never
+    collide.
     """
 
     def __init__(self, output: str | None):
         self.output_arg = output
         self.target: str | None = None if output is None else os.path.abspath(output)
         self.inputs: set[str] = set()
+        self.identities: set[tuple[int, int]] = set()
 
     def register_input(self, path: str, base_dir: str | None = None) -> None:
         if self.target is None or path == "-":
@@ -42,7 +68,11 @@ class RunContext:
             resolved = os.path.join(base_dir, path)
         else:
             resolved = path
-        self.inputs.add(os.path.abspath(resolved))
+        absolute = os.path.abspath(resolved)
+        self.inputs.add(os.path.normcase(absolute))
+        identity = _file_identity(absolute)
+        if identity is not None:
+            self.identities.add(identity)
 
 
 def register_manifest_references(
@@ -73,9 +103,20 @@ def output_conflict(ctx: RunContext) -> CommandFailure | None:
 
     Invoked only after the command's own validation has succeeded but
     before any result-producing computation runs, so no simulation or
-    re-run task executes and no file is modified.
+    re-run task executes and no file is modified. The target conflicts
+    when its normalized spelling matches a registered one (covering
+    declared-but-missing manifest references and case-only respellings on
+    case-insensitive file systems) or when it exists and its file identity
+    matches an existing input's (covering links, hard links and junction
+    aliases).
     """
-    if ctx.target is not None and ctx.target in ctx.inputs:
+    if ctx.target is None:
+        return None
+    conflict = os.path.normcase(ctx.target) in ctx.inputs
+    if not conflict:
+        identity = _file_identity(ctx.target)
+        conflict = identity is not None and identity in ctx.identities
+    if conflict:
         return CommandFailure(
             "output_error",
             f"output path {ctx.output_arg!r} is the same file as an input read by this command",
