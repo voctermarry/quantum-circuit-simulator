@@ -26,9 +26,9 @@ from __future__ import annotations
 import math
 
 from .core import SimulationError, run_probabilities, run_simulation
+from .gates import GATES, render_statement
 from .noise import validate_noise_model
 from .openqasm import Operation, Program, parse
-from .optimizer import _format_angle
 
 # Register sizes accepted by the DSL match the parser's limit.
 _MIN_REGISTER_SIZE = 1
@@ -77,16 +77,7 @@ def _operation_line(op: Operation) -> str:
     """Render one operation as an OpenQASM statement (register names q/c)."""
     if op.kind == "measure":
         return f"measure q[{op.targets[0]}] -> c[{op.targets[1]}];"
-    if op.kind in ("cx", "cz", "swap"):
-        return f"{op.kind} q[{op.targets[0]}],q[{op.targets[1]}];"
-    if op.kind in ("rx", "ry", "rz"):
-        return f"{op.kind}({_format_angle(op.params[0])}) q[{op.targets[0]}];"
-    if op.kind in ("crx", "cry", "crz"):
-        return (
-            f"{op.kind}({_format_angle(op.params[0])}) "
-            f"q[{op.targets[0]}],q[{op.targets[1]}];"
-        )
-    return f"{op.kind} q[{op.targets[0]}];"
+    return render_statement(op.kind, op.targets, op.params)
 
 
 class Circuit:
@@ -145,80 +136,62 @@ class Circuit:
         self._operations.append(op)
         return self
 
+    def _single_qubit_gate(self, kind: str, qubit: object) -> Circuit:
+        target = self._qubit_index(qubit)
+        self._check_gate_allowed(kind)
+        return self._append_gate(Operation(kind, (target,)))
+
     def x(self, qubit: int) -> Circuit:
         """Append an ``x`` gate on *qubit*."""
-        target = self._qubit_index(qubit)
-        self._check_gate_allowed("x")
-        return self._append_gate(Operation("x", (target,)))
+        return self._single_qubit_gate("x", qubit)
 
     def h(self, qubit: int) -> Circuit:
         """Append an ``h`` gate on *qubit*."""
-        target = self._qubit_index(qubit)
-        self._check_gate_allowed("h")
-        return self._append_gate(Operation("h", (target,)))
+        return self._single_qubit_gate("h", qubit)
 
     def y(self, qubit: int) -> Circuit:
         """Append a ``y`` gate on *qubit*."""
-        target = self._qubit_index(qubit)
-        self._check_gate_allowed("y")
-        return self._append_gate(Operation("y", (target,)))
+        return self._single_qubit_gate("y", qubit)
 
     def z(self, qubit: int) -> Circuit:
         """Append a ``z`` gate on *qubit*."""
-        target = self._qubit_index(qubit)
-        self._check_gate_allowed("z")
-        return self._append_gate(Operation("z", (target,)))
+        return self._single_qubit_gate("z", qubit)
 
     def s(self, qubit: int) -> Circuit:
         """Append an ``s`` gate on *qubit*."""
-        target = self._qubit_index(qubit)
-        self._check_gate_allowed("s")
-        return self._append_gate(Operation("s", (target,)))
+        return self._single_qubit_gate("s", qubit)
 
     def sdg(self, qubit: int) -> Circuit:
         """Append an ``sdg`` gate on *qubit*."""
-        target = self._qubit_index(qubit)
-        self._check_gate_allowed("sdg")
-        return self._append_gate(Operation("sdg", (target,)))
+        return self._single_qubit_gate("sdg", qubit)
 
     def t(self, qubit: int) -> Circuit:
         """Append a ``t`` gate on *qubit*."""
-        target = self._qubit_index(qubit)
-        self._check_gate_allowed("t")
-        return self._append_gate(Operation("t", (target,)))
+        return self._single_qubit_gate("t", qubit)
 
     def tdg(self, qubit: int) -> Circuit:
         """Append a ``tdg`` gate on *qubit*."""
-        target = self._qubit_index(qubit)
-        self._check_gate_allowed("tdg")
-        return self._append_gate(Operation("tdg", (target,)))
+        return self._single_qubit_gate("tdg", qubit)
 
-    def cx(self, control: int, target: int) -> Circuit:
-        """Append a ``cx`` gate from *control* to *target*."""
-        ctrl = self._qubit_index(control)
-        tgt = self._qubit_index(target)
-        if ctrl == tgt:
-            raise ValueError("cx control and target must be different qubits")
-        self._check_gate_allowed("cx")
-        return self._append_gate(Operation("cx", (ctrl, tgt)))
-
-    def cz(self, control: int, target: int) -> Circuit:
-        """Append a ``cz`` gate from *control* to *target*."""
-        ctrl = self._qubit_index(control)
-        tgt = self._qubit_index(target)
-        if ctrl == tgt:
-            raise ValueError("cz control and target must be different qubits")
-        self._check_gate_allowed("cz")
-        return self._append_gate(Operation("cz", (ctrl, tgt)))
-
-    def swap(self, first: int, second: int) -> Circuit:
-        """Append a ``swap`` gate exchanging *first* and *second*."""
+    def _two_qubit_gate(self, kind: str, first: object, second: object) -> Circuit:
         a = self._qubit_index(first)
         b = self._qubit_index(second)
         if a == b:
-            raise ValueError("swap operands must be different qubits")
-        self._check_gate_allowed("swap")
-        return self._append_gate(Operation("swap", (a, b)))
+            raise ValueError(f"{kind} {GATES[kind].operands_error}")
+        self._check_gate_allowed(kind)
+        return self._append_gate(Operation(kind, (a, b)))
+
+    def cx(self, control: int, target: int) -> Circuit:
+        """Append a ``cx`` gate from *control* to *target*."""
+        return self._two_qubit_gate("cx", control, target)
+
+    def cz(self, control: int, target: int) -> Circuit:
+        """Append a ``cz`` gate from *control* to *target*."""
+        return self._two_qubit_gate("cz", control, target)
+
+    def swap(self, first: int, second: int) -> Circuit:
+        """Append a ``swap`` gate exchanging *first* and *second*."""
+        return self._two_qubit_gate("swap", first, second)
 
     def _rotation(self, kind: str, angle: object, qubit: object) -> Circuit:
         theta = _check_angle(angle)
@@ -231,7 +204,7 @@ class Circuit:
         ctrl = self._qubit_index(control)
         tgt = self._qubit_index(target)
         if ctrl == tgt:
-            raise ValueError(f"{kind} control and target must be different qubits")
+            raise ValueError(f"{kind} {GATES[kind].operands_error}")
         self._check_gate_allowed(kind)
         return self._append_gate(Operation(kind, (ctrl, tgt), (theta,)))
 

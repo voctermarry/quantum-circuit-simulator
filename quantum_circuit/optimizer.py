@@ -29,17 +29,20 @@ phase of the controlled unitary), so ``2*pi`` is kept rather than deleted.
 from __future__ import annotations
 
 import heapq
-import math
 from dataclasses import dataclass
 
+from .gates import (
+    CONTROLLED_ROTATION_PERIOD,
+    GATES,
+    ROTATION_PERIOD,
+    format_angle,
+    render_statement,
+)
 from .openqasm import Operation, Program
 
 # Rotations this small (after normalization to (-pi, pi]) act as the
 # identity within floating-point precision and are removed.
 _ANGLE_EPSILON = 1e-12
-
-_ROTATIONS = ("rx", "ry", "rz")
-_CONTROLLED_ROTATIONS = ("crx", "cry", "crz")
 
 
 @dataclass(frozen=True)
@@ -55,18 +58,28 @@ class Gate:
         return frozenset(self.qubits)
 
 
-def normalize_angle(angle: float) -> float:
-    """Reduce *angle* modulo ``2*pi`` into the interval ``(-pi, pi]``.
+def _normalize_periodic(angle: float, period: float) -> float:
+    """Reduce *angle* modulo *period* into the interval ``(-period/2, period/2]``.
 
     Angles already inside the interval are returned untouched so ordinary
     values (e.g. ``0.7``) are not perturbed by floating-point modulo.
     """
-    if -math.pi < angle <= math.pi:
+    half = 0.5 * period
+    if -half < angle <= half:
         return angle
-    reduced = (angle + math.pi) % (2.0 * math.pi) - math.pi
-    if reduced == -math.pi:
-        return math.pi
+    reduced = (angle + half) % period - half
+    if reduced == -half:
+        return half
     return reduced
+
+
+def normalize_angle(angle: float) -> float:
+    """Reduce *angle* modulo ``2*pi`` into the interval ``(-pi, pi]``.
+
+    A single-qubit rotation by ``theta + 2*pi`` differs only by a global
+    phase, so the period is ``2*pi``.
+    """
+    return _normalize_periodic(angle, ROTATION_PERIOD)
 
 
 def normalize_controlled_angle(angle: float) -> float:
@@ -75,45 +88,24 @@ def normalize_controlled_angle(angle: float) -> float:
     A controlled rotation by ``theta + 2*pi`` differs from one by ``theta``
     by more than a global phase (the unshifted rotation picks up a sign on
     the control-1 block only), so the period is ``4*pi`` and ``2*pi`` itself
-    is kept. Angles already inside the interval are returned untouched.
+    is kept rather than deleted.
     """
-    if -2.0 * math.pi < angle <= 2.0 * math.pi:
-        return angle
-    reduced = (angle + 2.0 * math.pi) % (4.0 * math.pi) - 2.0 * math.pi
-    if reduced == -2.0 * math.pi:
-        return 2.0 * math.pi
-    return reduced
+    return _normalize_periodic(angle, CONTROLLED_ROTATION_PERIOD)
 
 
-def _format_angle(angle: float) -> str:
-    """Render a normalized angle deterministically.
-
-    Uses the shortest decimal representation that round-trips to the same
-    float (at most 17 significant digits), which Python writes as plain
-    decimal or lowercase scientific notation. Negative zero is written as
-    ``0``.
-    """
-    if angle == 0.0:
-        return "0"
-    return repr(angle)
+# Kept importable from here for existing internal callers; the definition
+# lives in the gate registry.
+_format_angle = format_angle
 
 
 def _gate_from_operation(op: Operation) -> Gate:
-    if op.kind in ("cx", "cz"):
-        return Gate(op.kind, (op.targets[0], op.targets[1]))
-    if op.kind == "swap":
-        # swap is symmetric in its operands; canonicalize the operand order
-        # so swap q[a],q[b] and swap q[b],q[a] share one canonical form.
-        return Gate(op.kind, tuple(sorted(op.targets)))
-    if op.kind in _ROTATIONS:
-        return Gate(op.kind, (op.targets[0],), normalize_angle(op.params[0]))
-    if op.kind in _CONTROLLED_ROTATIONS:
-        return Gate(
-            op.kind,
-            (op.targets[0], op.targets[1]),
-            normalize_controlled_angle(op.params[0]),
-        )
-    return Gate(op.kind, (op.targets[0],))
+    spec = GATES[op.kind]
+    # swap is symmetric in its operands; canonicalize the operand order so
+    # swap q[a],q[b] and swap q[b],q[a] share one canonical form.
+    qubits = tuple(sorted(op.targets)) if spec.symmetric else op.targets
+    if spec.angle_period is None:
+        return Gate(op.kind, qubits)
+    return Gate(op.kind, qubits, _normalize_periodic(op.params[0], spec.angle_period))
 
 
 def _sort_key(gate: Gate) -> tuple[int, int, str, str]:
@@ -123,19 +115,13 @@ def _sort_key(gate: Gate) -> tuple[int, int, str, str]:
     return (min(gate.qubits), max(gate.qubits), gate.kind, parameter)
 
 
-# Inverse pairs that cancel when adjacent on the same qubit.
-_INVERSE_PAIRS = (("s", "sdg"), ("sdg", "s"), ("t", "tdg"), ("tdg", "t"))
-
-
 def _cancels(first: Gate, second: Gate) -> bool:
     """True when *second* immediately follows *first* and both vanish."""
     if first.qubits != second.qubits:
         return False
-    if first.kind in ("x", "h", "y", "z", "swap"):
-        return first.kind == second.kind
-    if first.kind in ("cx", "cz"):
-        return second.kind == first.kind
-    return (first.kind, second.kind) in _INVERSE_PAIRS
+    # Self-inverse gates (x, h, y, z, cx, cz, swap) cancel their own kind;
+    # s/sdg and t/tdg cancel each other. Rotations merge instead.
+    return GATES[first.kind].inverse == second.kind
 
 
 def _merge(first: Gate, second: Gate) -> Gate | None:
@@ -147,22 +133,20 @@ def _merge(first: Gate, second: Gate) -> Gate | None:
     """
     if first.kind != second.kind or first.qubits != second.qubits:
         return None
-    if first.kind in _ROTATIONS:
-        assert first.angle is not None and second.angle is not None
-        return Gate(first.kind, first.qubits, normalize_angle(first.angle + second.angle))
-    if first.kind in _CONTROLLED_ROTATIONS:
-        assert first.angle is not None and second.angle is not None
-        return Gate(
-            first.kind,
-            first.qubits,
-            normalize_controlled_angle(first.angle + second.angle),
-        )
-    return None
+    spec = GATES[first.kind]
+    if spec.angle_period is None:
+        return None
+    assert first.angle is not None and second.angle is not None
+    return Gate(
+        first.kind,
+        first.qubits,
+        _normalize_periodic(first.angle + second.angle, spec.angle_period),
+    )
 
 
 def _is_identity_rotation(gate: Gate) -> bool:
     return (
-        gate.kind in _ROTATIONS + _CONTROLLED_ROTATIONS
+        GATES[gate.kind].angle_period is not None
         and gate.angle is not None
         and abs(gate.angle) <= _ANGLE_EPSILON
     )
@@ -266,18 +250,8 @@ def canonical_gates(operations: tuple[Operation, ...]) -> tuple[tuple[Gate, ...]
 
 
 def _gate_line(gate: Gate) -> str:
-    if gate.kind in ("cx", "cz", "swap"):
-        return f"{gate.kind} q[{gate.qubits[0]}],q[{gate.qubits[1]}];"
-    if gate.kind in _ROTATIONS:
-        assert gate.angle is not None
-        return f"{gate.kind}({_format_angle(gate.angle)}) q[{gate.qubits[0]}];"
-    if gate.kind in _CONTROLLED_ROTATIONS:
-        assert gate.angle is not None
-        return (
-            f"{gate.kind}({_format_angle(gate.angle)}) "
-            f"q[{gate.qubits[0]}],q[{gate.qubits[1]}];"
-        )
-    return f"{gate.kind} q[{gate.qubits[0]}];"
+    params = () if gate.angle is None else (gate.angle,)
+    return render_statement(gate.kind, gate.qubits, params)
 
 
 def render(program: Program, gates: tuple[Gate, ...]) -> str:

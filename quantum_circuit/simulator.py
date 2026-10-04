@@ -6,6 +6,7 @@ import cmath
 import math
 import random
 
+from .gates import GATES, gate_matrix, single_qubit_matrix
 from .openqasm import Operation, Program
 
 _SQRT1_2 = 2.0**-0.5
@@ -45,13 +46,12 @@ def _pauli_y(state: list[complex], qubit: int, num_qubits: int) -> None:
 
 
 # Phase gates diag(1, phase): z, s/sdg (diag(1, +-i)) and t/tdg
-# (phase exp(+-i*pi/4)).
+# (phase exp(+-i*pi/4)). The factors are the (1,1) entries of the
+# registry's single-qubit matrices.
 _PHASE_GATES = {
-    "z": -1 + 0j,
-    "s": 1j,
-    "sdg": -1j,
-    "t": cmath.exp(0.25j * math.pi),
-    "tdg": cmath.exp(-0.25j * math.pi),
+    kind: single_qubit_matrix(kind)[3]
+    for kind, spec in GATES.items()
+    if spec.diagonal
 }
 
 
@@ -102,18 +102,6 @@ def _controlled_single(
             b = state[high]
             state[low] = g00 * a + g01 * b
             state[high] = g10 * a + g11 * b
-
-
-def _rotation_matrix(kind: str, theta: float) -> tuple[complex, complex, complex, complex]:
-    """The single-qubit matrix of an rx/ry/rz rotation by *theta* radians."""
-    c = math.cos(theta / 2)
-    s = math.sin(theta / 2)
-    if kind == "rx":
-        return (c, -1j * s, -1j * s, c)
-    if kind == "ry":
-        return (c, -s, s, c)
-    # rz
-    return (cmath.exp(-0.5j * theta), 0j, 0j, cmath.exp(0.5j * theta))
 
 
 def _rx(state: list[complex], qubit: int, num_qubits: int, theta: float) -> None:
@@ -169,19 +157,22 @@ def _apply_gate(state: list[complex], op: Operation, num_qubits: int) -> None:
         _swap(state, op.targets[0], op.targets[1], num_qubits)
     elif op.kind == "cx":
         _controlled_x(state, op.targets[0], op.targets[1], num_qubits)
-    elif op.kind == "cz":
-        _controlled_single(
-            state, op.targets[0], op.targets[1], num_qubits, (1 + 0j, 0j, 0j, -1 + 0j)
-        )
     elif op.kind == "rx":
         _rx(state, op.targets[0], num_qubits, op.params[0])
     elif op.kind == "ry":
         _ry(state, op.targets[0], num_qubits, op.params[0])
     elif op.kind == "rz":
         _rz(state, op.targets[0], num_qubits, op.params[0])
-    elif op.kind in ("crx", "cry", "crz"):
-        matrix = _rotation_matrix(op.kind[1:], op.params[0])
-        _controlled_single(state, op.targets[0], op.targets[1], num_qubits, matrix)
+    else:
+        # cz, crx, cry, crz: the base gate's matrix applied to the target
+        # where the control bit is 1.
+        _controlled_single(
+            state,
+            op.targets[0],
+            op.targets[1],
+            num_qubits,
+            gate_matrix(op.kind, op.params),
+        )
 
 
 def simulate_state_vector(program: Program) -> list[complex]:
