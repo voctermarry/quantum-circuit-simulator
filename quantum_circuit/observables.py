@@ -7,10 +7,13 @@ acted on by the identity, and an empty operator list is the global
 identity. Expectations follow ``Tr(rho P)`` (the state-vector path uses
 ``<psi|P|psi>``), so they live in ``[-1, 1]``.
 
-The observables document is UTF-8 JSON with the same deterministic,
-strict structural style as the other JSON inputs: duplicate keys,
-unknown keys, type substitutions (including booleans posing as
-integers) and out-of-range counts are all rejected.
+This module owns the command's strict JSON document envelope: UTF-8 JSON
+with duplicate keys, unknown keys, non-standard ``NaN``/``Infinity``
+constants and booleans posing as integers all rejected, plus the required
+``schema_version`` 1. The carrier-independent content rules (batch size,
+ids and operator qubits/Paulis) live once in :mod:`observable_rules` and
+are shared with the Python DSL; here they are merely adapted to the JSON
+document's array/object conventions and exception boundary.
 """
 
 from __future__ import annotations
@@ -18,16 +21,19 @@ from __future__ import annotations
 import json
 import math
 
+from .observable_rules import (
+    JSON_CARRIER,
+    MAX_OBSERVABLES,  # re-exported: the limit is defined once with the rules
+    ObservableRuleError,
+    validate_observables_batch,
+)
+
 OBSERVABLES_SCHEMA_VERSION = 1
-MAX_OBSERVABLES = 100
 
 # Expectations this close to an endpoint are reported as the endpoint.
 EXPECTATION_TOLERANCE = 1e-15
 
 _OBSERVABLES_ROOT_KEYS = ("schema_version", "observables")
-_OBSERVABLE_KEYS = ("id", "operators")
-_OPERATOR_KEYS = ("qubit", "pauli")
-_PAULIS = ("X", "Y", "Z")
 
 
 class ObservableError(Exception):
@@ -63,6 +69,10 @@ def parse_observables(
     parsed circuit's register size and bounds every operator qubit. Raises
     :class:`ObservableError` on any syntax, structural, type or range
     problem.
+
+    Only the strict JSON envelope (syntax, the root object and
+    ``schema_version``) is command-specific; the observables content is
+    checked by the shared :func:`validate_observables_batch` rules.
     """
     try:
         data = json.loads(
@@ -88,74 +98,12 @@ def parse_observables(
 
     if "observables" not in data:
         raise ObservableError("observables document is missing required key 'observables'")
-    observables = data["observables"]
-    if not isinstance(observables, list):
-        raise ObservableError("'observables' must be an array")
-    if not 1 <= len(observables) <= MAX_OBSERVABLES:
-        raise ObservableError(
-            f"'observables' must contain between 1 and {MAX_OBSERVABLES} entries, "
-            f"got {len(observables)}"
-        )
 
-    parsed: list[tuple[str, list[tuple[int, str]]]] = []
-    seen_ids: set[str] = set()
-    for index, item in enumerate(observables):
-        where = f"observables[{index}]"
-        if not isinstance(item, dict):
-            raise ObservableError(f"{where} must be a JSON object")
-        for key in item:
-            if key not in _OBSERVABLE_KEYS:
-                raise ObservableError(f"{where} has unknown key {key!r}")
+    try:
+        return validate_observables_batch(JSON_CARRIER, data["observables"], num_qubits)
+    except ObservableRuleError as exc:
+        raise ObservableError(exc.message) from None
 
-        if "id" not in item:
-            raise ObservableError(f"{where} is missing required key 'id'")
-        observable_id = item["id"]
-        if not isinstance(observable_id, str) or not observable_id:
-            raise ObservableError(f"{where} 'id' must be a non-empty string")
-        if observable_id in seen_ids:
-            raise ObservableError(f"duplicate observable id {observable_id!r}")
-        seen_ids.add(observable_id)
-
-        if "operators" not in item:
-            raise ObservableError(f"{where} is missing required key 'operators'")
-        operators = item["operators"]
-        if not isinstance(operators, list):
-            raise ObservableError(f"{where} 'operators' must be an array")
-
-        parsed_operators: list[tuple[int, str]] = []
-        seen_qubits: set[int] = set()
-        for op_index, operator in enumerate(operators):
-            op_where = f"{where}.operators[{op_index}]"
-            if not isinstance(operator, dict):
-                raise ObservableError(f"{op_where} must be a JSON object")
-            for key in operator:
-                if key not in _OPERATOR_KEYS:
-                    raise ObservableError(f"{op_where} has unknown key {key!r}")
-
-            if "qubit" not in operator:
-                raise ObservableError(f"{op_where} is missing required key 'qubit'")
-            qubit = operator["qubit"]
-            if not _is_json_int(qubit) or not 0 <= qubit < num_qubits:
-                raise ObservableError(
-                    f"{op_where} 'qubit' must be an integer between 0 and {num_qubits - 1}, "
-                    f"got {qubit!r}"
-                )
-            if qubit in seen_qubits:
-                raise ObservableError(f"{op_where} repeats qubit {qubit} within {where}")
-            seen_qubits.add(qubit)
-
-            if "pauli" not in operator:
-                raise ObservableError(f"{op_where} is missing required key 'pauli'")
-            pauli = operator["pauli"]
-            if pauli not in _PAULIS:
-                raise ObservableError(
-                    f"{op_where} 'pauli' must be one of 'X', 'Y', 'Z', got {pauli!r}"
-                )
-
-            parsed_operators.append((qubit, pauli))
-        parsed.append((observable_id, parsed_operators))
-
-    return parsed
 
 
 def snap_expectation(value: float) -> float | int:
