@@ -11,12 +11,23 @@ The observables document is UTF-8 JSON with the same deterministic,
 strict structural style as the other JSON inputs: duplicate keys,
 unknown keys, type substitutions (including booleans posing as
 integers) and out-of-range counts are all rejected.
+
+The domain rules are shared by both entry points: the ``expectation``
+command validates a decoded JSON document through
+:func:`parse_observables`, while :meth:`Circuit.expectation
+<quantum_circuit.circuit.Circuit.expectation>` validates native Python
+objects through :func:`validate_observables`. Both are thin carriers
+around :func:`_validate_observables`, the single carrier-independent
+source of the batch/operator/qubit/Pauli rules; only the container
+predicates (strict JSON ``dict``/``list`` versus mappings and
+lists/tuples), the error wording and the exception types differ.
 """
 
 from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 
 OBSERVABLES_SCHEMA_VERSION = 1
 MAX_OBSERVABLES = 100
@@ -25,8 +36,8 @@ MAX_OBSERVABLES = 100
 EXPECTATION_TOLERANCE = 1e-15
 
 _OBSERVABLES_ROOT_KEYS = ("schema_version", "observables")
-_OBSERVABLE_KEYS = ("id", "operators")
-_OPERATOR_KEYS = ("qubit", "pauli")
+_OBSERVABLE_FIELDS = ("id", "operators")
+_OPERATOR_FIELDS = ("qubit", "pauli")
 _PAULIS = ("X", "Y", "Z")
 
 
@@ -53,6 +64,252 @@ def _object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+class _ObservablesCarrier:
+    """Carrier-specific containers, wording and exception classes.
+
+    The carrier-independent traversal lives once in
+    :func:`_validate_observables`; a carrier only decides what counts as
+    a mapping or a sequence, how each failure is worded and whether a
+    type failure surfaces as :class:`TypeError` (the Python DSL) or as
+    the carrier-neutral :class:`ObservableError` (the JSON command).
+    """
+
+    type_exc: type[Exception] = TypeError
+    value_exc: type[Exception] = ValueError
+    object_phrase = "a mapping"
+    sequence_phrase = "a list or tuple"
+    field_noun = "field"
+    batch_name = "observables"
+    append_type_name = True
+
+    def is_mapping(self, value: object) -> bool:
+        return isinstance(value, Mapping)
+
+    def is_sequence(self, value: object) -> bool:
+        # Lists and tuples only: strings, booleans and arbitrary other
+        # iterables/generators are not observable batches.
+        return isinstance(value, (list, tuple))
+
+    def is_int(self, value: object) -> bool:
+        # bool is a subclass of int but is never accepted as a qubit here.
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    def _type(self, message: str) -> Exception:
+        return self.type_exc(message)
+
+    def _value(self, message: str) -> Exception:
+        return self.value_exc(message)
+
+    def _container_error(self, label: str, phrase: str, value: object) -> Exception:
+        message = f"{label} must be {phrase}"
+        if self.append_type_name:
+            message += f", got {type(value).__name__}"
+        return self._type(message)
+
+    def batch_not_sequence(self, value: object) -> Exception:
+        return self._container_error(self.batch_name, self.sequence_phrase, value)
+
+    def bad_count(self, count: int) -> Exception:
+        return self._value(
+            f"{self.batch_name} must contain between 1 and {MAX_OBSERVABLES} "
+            f"entries, got {count}"
+        )
+
+    def item_not_mapping(self, where: str, value: object) -> Exception:
+        return self._container_error(where, self.object_phrase, value)
+
+    def unknown_field(self, where: str, key: object) -> Exception:
+        return self._value(f"{where} has unknown {self.field_noun} {key!r}")
+
+    def missing_field(self, where: str, name: str) -> Exception:
+        return self._value(f"{where} is missing required {self.field_noun} {name!r}")
+
+    def id_wrong_type(self, where: str, value: object) -> Exception:
+        return self._type(f"{where} 'id' must be a string, got {type(value).__name__}")
+
+    def id_empty(self, where: str) -> Exception:
+        return self._value(f"{where} 'id' must be a non-empty string")
+
+    def duplicate_id(self, value: str) -> Exception:
+        return self._value(f"duplicate observable id {value!r}")
+
+    def operators_not_sequence(self, where: str, value: object) -> Exception:
+        return self._container_error(f"{where} 'operators'", self.sequence_phrase, value)
+
+    def operator_not_mapping(self, op_where: str, value: object) -> Exception:
+        return self._container_error(op_where, self.object_phrase, value)
+
+    def qubit_wrong_type(self, op_where: str, value: object, num_qubits: int) -> Exception:
+        return self._type(
+            f"{op_where} 'qubit' must be an integer, got {type(value).__name__}"
+        )
+
+    def qubit_out_of_range(self, op_where: str, qubit: int, num_qubits: int) -> Exception:
+        return self._value(
+            f"{op_where} 'qubit' {qubit} out of range for register of size {num_qubits}"
+        )
+
+    def duplicate_qubit(self, op_where: str, qubit: int, where: str) -> Exception:
+        return self._value(f"{op_where} repeats qubit {qubit} within {where}")
+
+    def pauli_wrong_type(self, op_where: str, value: object) -> Exception:
+        return self._type(
+            f"{op_where} 'pauli' must be a string, got {type(value).__name__}"
+        )
+
+    def bad_pauli(self, op_where: str, value: object) -> Exception:
+        return self._value(
+            f"{op_where} 'pauli' must be one of 'X', 'Y', 'Z', got {value!r}"
+        )
+
+
+class _JsonObservablesCarrier(_ObservablesCarrier):
+    """Strict JSON shapes: only ``dict``/``list``, every failure one error."""
+
+    type_exc = ObservableError
+    value_exc = ObservableError
+    object_phrase = "a JSON object"
+    sequence_phrase = "an array"
+    field_noun = "key"
+    batch_name = "'observables'"
+    append_type_name = False
+
+    def is_mapping(self, value: object) -> bool:
+        return isinstance(value, dict)
+
+    def is_sequence(self, value: object) -> bool:
+        return isinstance(value, list)
+
+    # The document historically reports type and content of 'id', 'qubit'
+    # and 'pauli' with one combined message each.
+    def id_wrong_type(self, where: str, value: object) -> Exception:
+        return ObservableError(f"{where} 'id' must be a non-empty string")
+
+    def id_empty(self, where: str) -> Exception:
+        return ObservableError(f"{where} 'id' must be a non-empty string")
+
+    def qubit_wrong_type(self, op_where: str, value: object, num_qubits: int) -> Exception:
+        return ObservableError(
+            f"{op_where} 'qubit' must be an integer between 0 and {num_qubits - 1}, "
+            f"got {value!r}"
+        )
+
+    def qubit_out_of_range(self, op_where: str, qubit: int, num_qubits: int) -> Exception:
+        return ObservableError(
+            f"{op_where} 'qubit' must be an integer between 0 and {num_qubits - 1}, "
+            f"got {qubit!r}"
+        )
+
+    def pauli_wrong_type(self, op_where: str, value: object) -> Exception:
+        return ObservableError(
+            f"{op_where} 'pauli' must be one of 'X', 'Y', 'Z', got {value!r}"
+        )
+
+
+_PYTHON_CARRIER = _ObservablesCarrier()
+_JSON_CARRIER = _JsonObservablesCarrier()
+
+
+def _validate_observables(
+    carrier: _ObservablesCarrier,
+    observables: object,
+    num_qubits: int,
+) -> list[tuple[str, list[tuple[int, str]]]]:
+    """Validate one observables batch, the single carrier-independent rule set.
+
+    Returns the observables in input order as ``(id, operators)`` pairs,
+    each operator a ``(qubit, pauli)`` tuple. The batch is checked in one
+    fixed order — container, count, then per observable the unknown-field
+    sweep, ``id`` (presence, type, emptiness, uniqueness) and
+    ``operators`` (container, then per operator the unknown-field sweep,
+    ``qubit`` presence/type/range/uniqueness and ``pauli``
+    presence/type/value) — before anything is returned, so callers always
+    fail before evolving any state. *carrier* supplies only the accepted
+    container types, the wording and the exception classes.
+    """
+    if not carrier.is_sequence(observables):
+        raise carrier.batch_not_sequence(observables)
+    if not 1 <= len(observables) <= MAX_OBSERVABLES:
+        raise carrier.bad_count(len(observables))
+
+    parsed: list[tuple[str, list[tuple[int, str]]]] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(observables):
+        where = f"observables[{index}]"
+        if not carrier.is_mapping(item):
+            raise carrier.item_not_mapping(where, item)
+        for key in item:
+            if key not in _OBSERVABLE_FIELDS:
+                raise carrier.unknown_field(where, key)
+
+        if "id" not in item:
+            raise carrier.missing_field(where, "id")
+        observable_id = item["id"]
+        if not isinstance(observable_id, str):
+            raise carrier.id_wrong_type(where, observable_id)
+        if not observable_id:
+            raise carrier.id_empty(where)
+        if observable_id in seen_ids:
+            raise carrier.duplicate_id(observable_id)
+        seen_ids.add(observable_id)
+
+        if "operators" not in item:
+            raise carrier.missing_field(where, "operators")
+        operators = item["operators"]
+        if not carrier.is_sequence(operators):
+            raise carrier.operators_not_sequence(where, operators)
+
+        parsed_operators: list[tuple[int, str]] = []
+        seen_qubits: set[int] = set()
+        for op_index, operator in enumerate(operators):
+            op_where = f"{where}.operators[{op_index}]"
+            if not carrier.is_mapping(operator):
+                raise carrier.operator_not_mapping(op_where, operator)
+            for key in operator:
+                if key not in _OPERATOR_FIELDS:
+                    raise carrier.unknown_field(op_where, key)
+
+            if "qubit" not in operator:
+                raise carrier.missing_field(op_where, "qubit")
+            qubit = operator["qubit"]
+            if not carrier.is_int(qubit):
+                raise carrier.qubit_wrong_type(op_where, qubit, num_qubits)
+            if not 0 <= qubit < num_qubits:
+                raise carrier.qubit_out_of_range(op_where, qubit, num_qubits)
+            if qubit in seen_qubits:
+                raise carrier.duplicate_qubit(op_where, qubit, where)
+            seen_qubits.add(qubit)
+
+            if "pauli" not in operator:
+                raise carrier.missing_field(op_where, "pauli")
+            pauli = operator["pauli"]
+            if not isinstance(pauli, str):
+                raise carrier.pauli_wrong_type(op_where, pauli)
+            if pauli not in _PAULIS:
+                raise carrier.bad_pauli(op_where, pauli)
+
+            parsed_operators.append((qubit, pauli))
+        parsed.append((observable_id, parsed_operators))
+
+    return parsed
+
+
+def validate_observables(
+    observables: object, num_qubits: int
+) -> list[tuple[str, list[tuple[int, str]]]]:
+    """Validate native Python observables for ``Circuit.expectation``.
+
+    Mirrors :func:`parse_observables` for the DSL's public input shapes:
+    a list or tuple of mappings whose ``operators`` are lists or tuples
+    of mappings. Type mismatches raise the built-in :class:`TypeError`;
+    size, field, identifier, qubit and Pauli violations raise the
+    built-in :class:`ValueError` -- the exception type is itself a
+    carrier property, so this path shares the rule set without adopting
+    the command's :class:`ObservableError`.
+    """
+    return _validate_observables(_PYTHON_CARRIER, observables, num_qubits)
+
+
 def parse_observables(
     text: str, num_qubits: int
 ) -> list[tuple[str, list[tuple[int, str]]]]:
@@ -63,6 +320,11 @@ def parse_observables(
     parsed circuit's register size and bounds every operator qubit. Raises
     :class:`ObservableError` on any syntax, structural, type or range
     problem.
+
+    The JSON-specific envelope (syntax, duplicate keys, non-standard
+    constants, the root object, ``schema_version``) is checked here; the
+    observable entries themselves go through the same
+    :func:`_validate_observables` traversal as the Python DSL.
     """
     try:
         data = json.loads(
@@ -88,74 +350,8 @@ def parse_observables(
 
     if "observables" not in data:
         raise ObservableError("observables document is missing required key 'observables'")
-    observables = data["observables"]
-    if not isinstance(observables, list):
-        raise ObservableError("'observables' must be an array")
-    if not 1 <= len(observables) <= MAX_OBSERVABLES:
-        raise ObservableError(
-            f"'observables' must contain between 1 and {MAX_OBSERVABLES} entries, "
-            f"got {len(observables)}"
-        )
 
-    parsed: list[tuple[str, list[tuple[int, str]]]] = []
-    seen_ids: set[str] = set()
-    for index, item in enumerate(observables):
-        where = f"observables[{index}]"
-        if not isinstance(item, dict):
-            raise ObservableError(f"{where} must be a JSON object")
-        for key in item:
-            if key not in _OBSERVABLE_KEYS:
-                raise ObservableError(f"{where} has unknown key {key!r}")
-
-        if "id" not in item:
-            raise ObservableError(f"{where} is missing required key 'id'")
-        observable_id = item["id"]
-        if not isinstance(observable_id, str) or not observable_id:
-            raise ObservableError(f"{where} 'id' must be a non-empty string")
-        if observable_id in seen_ids:
-            raise ObservableError(f"duplicate observable id {observable_id!r}")
-        seen_ids.add(observable_id)
-
-        if "operators" not in item:
-            raise ObservableError(f"{where} is missing required key 'operators'")
-        operators = item["operators"]
-        if not isinstance(operators, list):
-            raise ObservableError(f"{where} 'operators' must be an array")
-
-        parsed_operators: list[tuple[int, str]] = []
-        seen_qubits: set[int] = set()
-        for op_index, operator in enumerate(operators):
-            op_where = f"{where}.operators[{op_index}]"
-            if not isinstance(operator, dict):
-                raise ObservableError(f"{op_where} must be a JSON object")
-            for key in operator:
-                if key not in _OPERATOR_KEYS:
-                    raise ObservableError(f"{op_where} has unknown key {key!r}")
-
-            if "qubit" not in operator:
-                raise ObservableError(f"{op_where} is missing required key 'qubit'")
-            qubit = operator["qubit"]
-            if not _is_json_int(qubit) or not 0 <= qubit < num_qubits:
-                raise ObservableError(
-                    f"{op_where} 'qubit' must be an integer between 0 and {num_qubits - 1}, "
-                    f"got {qubit!r}"
-                )
-            if qubit in seen_qubits:
-                raise ObservableError(f"{op_where} repeats qubit {qubit} within {where}")
-            seen_qubits.add(qubit)
-
-            if "pauli" not in operator:
-                raise ObservableError(f"{op_where} is missing required key 'pauli'")
-            pauli = operator["pauli"]
-            if pauli not in _PAULIS:
-                raise ObservableError(
-                    f"{op_where} 'pauli' must be one of 'X', 'Y', 'Z', got {pauli!r}"
-                )
-
-            parsed_operators.append((qubit, pauli))
-        parsed.append((observable_id, parsed_operators))
-
-    return parsed
+    return _validate_observables(_JSON_CARRIER, data["observables"], num_qubits)
 
 
 def snap_expectation(value: float) -> float | int:
